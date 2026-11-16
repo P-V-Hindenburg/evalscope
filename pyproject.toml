@@ -54,6 +54,7 @@ app              = {file = ["requirements/app.txt"]}
 aigc             = {file = ["requirements/aigc.txt"]}
 sandbox          = {file = ["requirements/sandbox.txt"]}
 service          = {file = ["requirements/service.txt", "requirements/perf.txt"]}
+agent_api        = {file = ["requirements/agent_api.txt"]}
 mcp              = {file = ["requirements/mcp.txt"]}
 dev              = {file = ["requirements/dev.txt"]}
 docs             = {file = ["requirements/docs.txt"]}
@@ -91,7 +92,8 @@ all = {file = [
   "requirements/perf.txt",
   "requirements/app.txt",
   "requirements/aigc.txt",
-  "requirements/service.txt"
+  "requirements/service.txt",
+  "requirements/agent_api.txt"
 ]}
 
 [tool.pytest.ini_options]
