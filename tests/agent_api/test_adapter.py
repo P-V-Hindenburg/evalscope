@@ -9,8 +9,9 @@ from evalscope.agent_api import (
     resolve_credentials,
     validate_evaluation,
 )
-from evalscope.agent_api.results import sample_summary
+from evalscope.agent_api.adapter import _stop_process
 from evalscope.agent_api.contracts import BenchmarkResult, MetricResult
+from evalscope.agent_api.results import sample_summary
 
 
 def _target(modality='multimodal'):
@@ -81,3 +82,31 @@ def test_sample_summary_preserves_partial_success_counts():
     assert summary.failed == 1
     assert summary.scored == 9
     assert summary.error_counts == {'sample_error': 1}
+
+
+def test_stop_process_escalates_when_worker_ignores_terminate():
+    class StubbornProcess:
+        def __init__(self):
+            self.alive = True
+            self.terminated = 0
+            self.killed = 0
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated += 1
+
+        def kill(self):
+            self.killed += 1
+            self.alive = False
+
+        def join(self, timeout=None):
+            return None
+
+    process = StubbornProcess()
+
+    assert _stop_process(process, cleanup_timeout=0.01) is True
+    assert process.terminated == 1
+    assert process.killed == 1
+    assert process.is_alive() is False

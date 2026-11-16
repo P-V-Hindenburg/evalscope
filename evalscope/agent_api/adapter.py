@@ -1,7 +1,7 @@
 """Thin Python adapter from agent contracts to EvalScope TaskConfig and run_task."""
 
-import os
 import multiprocessing as mp
+import os
 import queue
 import re
 import socket
@@ -17,8 +17,8 @@ from evalscope import TaskConfig, run_task
 from evalscope.config import JudgeConfig, JudgeModelConfig, SandboxTaskConfig
 from evalscope.utils.uri_utils import validate_http_endpoint
 
-from .catalog import BenchmarkNotFoundError, get_benchmark
 from .cache import dataset_cache_available
+from .catalog import BenchmarkNotFoundError, get_benchmark
 from .contracts import (
     ArtifactRefs,
     BenchmarkResult,
@@ -66,9 +66,7 @@ def validate_evaluation(request: EvaluationRequest) -> ResolvedEvaluationPlan:
         names = ', '.join(judge_benchmarks)
         raise EvaluationValidationError(f'judge profile required for benchmarks: {names}')
 
-    benchmark_hubs = {
-        item.benchmark_id: request.dataset_hub or item.default_dataset_hub for item in benchmarks
-    }
+    benchmark_hubs = {item.benchmark_id: request.dataset_hub or item.default_dataset_hub for item in benchmarks}
     return ResolvedEvaluationPlan(
         request=request,
         benchmarks=benchmarks,
@@ -134,12 +132,11 @@ def build_task_configs(
         use_cache = plan.request.use_cache
         if use_cache and multiple_groups:
             use_cache = os.path.join(use_cache, group_name)
-        sandbox_enabled = any(
-            item.requires_sandbox for item in plan.benchmarks if item.benchmark_id in benchmarks
-        )
+        sandbox_enabled = any(item.requires_sandbox for item in plan.benchmarks if item.benchmark_id in benchmarks)
         dataset_args = {
             name: dict(plan.request.dataset_args.get(name, {}))
-            for name in benchmarks if name in plan.request.dataset_args
+            for name in benchmarks
+            if name in plan.request.dataset_args
         }
         for item in plan.benchmarks:
             if item.benchmark_id in benchmarks and item.requires_sandbox:
@@ -193,20 +190,68 @@ def _classify_error(exc: Exception, benchmarks: List[str]) -> EvaluationError:
     message = str(exc)
     lowered = message.lower()
     if 'cancelled' in lowered:
-        return EvaluationError(code='CANCELLED', stage='execution', category='cancelled', message=message, benchmarks=benchmarks)
+        return EvaluationError(
+            code='CANCELLED', stage='execution', category='cancelled', message=message, benchmarks=benchmarks
+        )
     if 'maximum allowed total pixels' in lowered or 'image exceeds' in lowered:
-        return EvaluationError(code='IMAGE_LIMIT_EXCEEDED', stage='model', category='image_limit_exceeded', message=message, benchmarks=benchmarks)
+        return EvaluationError(
+            code='IMAGE_LIMIT_EXCEEDED',
+            stage='model',
+            category='image_limit_exceeded',
+            message=message,
+            benchmarks=benchmarks,
+        )
     if 'network is unreachable' in lowered or 'connection refused' in lowered:
-        return EvaluationError(code='NETWORK_UNREACHABLE', stage='execution', category='network', message=message, benchmarks=benchmarks, retryable=True)
+        return EvaluationError(
+            code='NETWORK_UNREACHABLE',
+            stage='execution',
+            category='network',
+            message=message,
+            benchmarks=benchmarks,
+            retryable=True,
+        )
     if 'timed out' in lowered or 'timeout' in lowered:
-        return EvaluationError(code='TASK_TIMEOUT', stage='execution', category='timeout', message=message, benchmarks=benchmarks, retryable=True)
+        return EvaluationError(
+            code='TASK_TIMEOUT',
+            stage='execution',
+            category='timeout',
+            message=message,
+            benchmarks=benchmarks,
+            retryable=True,
+        )
     if 'judge' in lowered and ('parse' in lowered or 'format' in lowered):
-        return EvaluationError(code='JUDGE_PARSE_FAILED', stage='judge', category='judge_parse_failed', message=message, benchmarks=benchmarks, retryable=True)
+        return EvaluationError(
+            code='JUDGE_PARSE_FAILED',
+            stage='judge',
+            category='judge_parse_failed',
+            message=message,
+            benchmarks=benchmarks,
+            retryable=True,
+        )
     if 'sandbox' in lowered or 'code execution' in lowered:
-        return EvaluationError(code='SANDBOX_EXECUTION_FAILED', stage='sandbox', category='sandbox_execution_failed', message=message, benchmarks=benchmarks)
+        return EvaluationError(
+            code='SANDBOX_EXECUTION_FAILED',
+            stage='sandbox',
+            category='sandbox_execution_failed',
+            message=message,
+            benchmarks=benchmarks,
+        )
     if 'dataset' in lowered or 'huggingface' in lowered or 'modelscope' in lowered:
-        return EvaluationError(code='DATASET_LOAD_FAILED', stage='dataset_load', category='dataset', message=message, benchmarks=benchmarks, retryable=True)
-    return EvaluationError(code='EVALUATION_EXECUTION_FAILED', stage='execution', category='unknown', message=message, benchmarks=benchmarks)
+        return EvaluationError(
+            code='DATASET_LOAD_FAILED',
+            stage='dataset_load',
+            category='dataset',
+            message=message,
+            benchmarks=benchmarks,
+            retryable=True,
+        )
+    return EvaluationError(
+        code='EVALUATION_EXECUTION_FAILED',
+        stage='execution',
+        category='unknown',
+        message=message,
+        benchmarks=benchmarks,
+    )
 
 
 def _run_task_worker(config: TaskConfig, output: mp.Queue) -> None:
@@ -229,6 +274,23 @@ def _run_task_worker(config: TaskConfig, output: mp.Queue) -> None:
         output.put({'ok': False, 'error_type': type(exc).__name__, 'message': str(exc)})
 
 
+def _stop_process(process: mp.Process, cleanup_timeout: float) -> bool:
+    """Stop a worker, escalating from SIGTERM to SIGKILL when necessary.
+
+    Network clients and sandbox cleanup handlers may delay or ignore a normal
+    termination signal. Returning ``True`` means cleanup required escalation.
+    """
+
+    if not process.is_alive():
+        return False
+    process.terminate()
+    process.join(timeout=cleanup_timeout)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=cleanup_timeout)
+    return True
+
+
 def _run_config_isolated(config: TaskConfig, task_timeout: float, cleanup_timeout: float, cancel_event=None):
     """Run EvalScope in a child process so sandbox/background resources cannot hang the API."""
 
@@ -241,8 +303,7 @@ def _run_config_isolated(config: TaskConfig, task_timeout: float, cleanup_timeou
     recovered = []
     while time.time() < deadline:
         if cancel_event is not None and cancel_event.is_set():
-            process.terminate()
-            process.join(timeout=cleanup_timeout)
+            _stop_process(process, cleanup_timeout)
             raise EvaluationCancelledError('evaluation cancelled by caller')
         try:
             payload = output.get(timeout=min(1.0, max(0.01, deadline - time.time())))
@@ -253,19 +314,17 @@ def _run_config_isolated(config: TaskConfig, task_timeout: float, cleanup_timeou
                 break
 
     if payload is None and not recovered and time.time() >= deadline:
-        process.terminate()
-        process.join(timeout=cleanup_timeout)
+        _stop_process(process, cleanup_timeout)
         raise TimeoutError(f'evaluation exceeded {task_timeout} seconds')
 
     process.join(timeout=cleanup_timeout)
     cleanup_timed_out = process.is_alive()
     if cleanup_timed_out:
-        process.terminate()
-        process.join(timeout=cleanup_timeout)
+        _stop_process(process, cleanup_timeout)
 
     if payload is not None:
         if not payload['ok']:
-            raise RuntimeError(f"{payload['error_type']}: {payload['message']}")
+            raise RuntimeError(f'{payload["error_type"]}: {payload["message"]}')
         results = [BenchmarkResult.model_validate(item) for item in payload['results']]
     else:
         results = recovered
@@ -307,14 +366,16 @@ def run_evaluation(
             )
             result_groups.append(group)
             if cleanup_timed_out:
-                errors.append(EvaluationError(
-                    code='CLEANUP_TIMEOUT_RECOVERED',
-                    stage='cleanup',
-                    category='cleanup_timeout',
-                    message='evaluation report was recovered, but worker cleanup exceeded its deadline',
-                    benchmarks=list(config.datasets),
-                    retryable=False,
-                ))
+                errors.append(
+                    EvaluationError(
+                        code='CLEANUP_TIMEOUT_RECOVERED',
+                        stage='cleanup',
+                        category='cleanup_timeout',
+                        message='evaluation report was recovered, but worker cleanup exceeded its deadline',
+                        benchmarks=list(config.datasets),
+                        retryable=False,
+                    )
+                )
         except EvaluationCancelledError:
             raise
         except Exception as exc:
