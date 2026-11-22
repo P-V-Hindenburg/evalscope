@@ -1,6 +1,7 @@
 """In-process asynchronous facade for LangChain/LangGraph tool calls."""
 
 import json
+import re
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -70,16 +71,99 @@ class EvaluationJobManager:
                 cancel_event=self._cancel_events[job_id],
                 stage_callback=lambda stage: self._set_stage(job_id, stage),
             )
-            self._update(job_id, status=result.status, result=result)
+            self._refresh_progress(job_id)
+            job = self.status(job_id, refresh=False)
+            total = result.sample_summary.planned or job.progress.total
+            terminal_progress = job.progress.model_copy(update={
+                'current': total if total is not None else job.progress.current,
+                'total': total,
+                'percent': 100.0,
+                'current_benchmark': None,
+                'stage': result.status,
+            })
+            self._update(job_id, status=result.status, result=result, progress=terminal_progress)
         except EvaluationCancelledError:
-            self._update(job_id, status='cancelled', message='cancelled by caller')
+            self._set_terminal(job_id, 'cancelled', message='cancelled by caller')
         except Exception as exc:
-            self._update(job_id, status='failed', message=str(exc))
+            self._set_terminal(job_id, 'failed', message=str(exc))
 
     def _update(self, job_id: str, **changes) -> None:
         with self._lock:
             current = self._jobs[job_id]
             self._jobs[job_id] = current.model_copy(update={**changes, 'updated_at': datetime.now(timezone.utc)})
+
+    def _set_terminal(self, job_id: str, status: JobStatus, message: Optional[str] = None) -> None:
+        self._refresh_progress(job_id)
+        job = self.status(job_id, refresh=False)
+        progress = job.progress.model_copy(update={'stage': status, 'current_benchmark': None})
+        self._update(job_id, status=status, message=message, progress=progress)
+
+    @staticmethod
+    def _progress_stage(data: dict, request: EvaluationRequest, fallback: JobStatus):
+        stage_data = data.get('stage') or {}
+        nodes = [stage_data]
+        nodes.extend(stage_data.get('children') or [])
+        running = next((node for node in reversed(nodes) if node.get('status') == 'running'), stage_data)
+        name = str(running.get('name') or '').lower()
+        if 'predict' in name:
+            stage = 'running_model'
+        elif 'review' in name:
+            stage = 'running_judge' if request.judge else 'scoring'
+        elif 'score' in name or 'aggregat' in name:
+            stage = 'scoring'
+        elif 'report' in name:
+            stage = 'generating_report'
+        else:
+            stage = fallback
+        return stage, stage_data.get('label')
+
+    @staticmethod
+    def _log_progress_fallback(root: Path, fallback: JobStatus):
+        """Infer the current stage from the newest event on older EvalScope versions."""
+
+        logs = sorted(root.glob('**/eval_log.log'), key=lambda path: path.stat().st_mtime, reverse=True)
+        if not logs:
+            return fallback, None
+        try:
+            lines = logs[0].read_text(encoding='utf-8', errors='replace').splitlines()[-300:]
+        except OSError:
+            return fallback, None
+
+        current_benchmark = None
+        for line in reversed(lines):
+            match = re.search(r'Start loading benchmark dataset:\s*([^\s]+)', line)
+            if not match:
+                match = re.search(r'Evaluating\[([^\]]+)\]', line)
+            if match:
+                current_benchmark = match.group(1).lower()
+                break
+
+        # Read backwards so an old "Generating report" line cannot override a
+        # newer benchmark's loading or prediction event.
+        for line in reversed(lines):
+            if 'Start loading benchmark dataset:' in line:
+                return 'loading_dataset', current_benchmark
+            if re.search(r'Evaluating\[[^\]]+\]', line):
+                return 'running_model', current_benchmark
+            if 'predictions complete, aggregating scores' in line or 'Aggregating scores for subset:' in line:
+                return 'scoring', current_benchmark
+            if 'Generating report' in line:
+                return 'generating_report', current_benchmark
+        return fallback, current_benchmark
+
+    @staticmethod
+    def _completed_sample_count(root: Path) -> int:
+        """Count samples covered by reports that have already been finalized."""
+
+        completed = 0
+        for path in root.glob('**/reports/*/*.json'):
+            try:
+                report = json.loads(path.read_text(encoding='utf-8'))
+                execution = report.get('execution_summary') or {}
+                completed += int(execution.get('requested') or report.get('num') or 0)
+            except (OSError, ValueError, TypeError):
+                continue
+        return completed
 
     def _refresh_progress(self, job_id: str) -> None:
         request = self._requests[job_id]
@@ -88,33 +172,32 @@ class EvaluationJobManager:
         if not files:
             return
         processed = total = 0
+        snapshots = []
         for path in files:
             try:
                 data = json.loads(path.read_text(encoding='utf-8'))
                 processed += int(data.get('processed_count') or 0)
                 total += int(data.get('total_count') or 0)
+                snapshots.append((path.stat().st_mtime, data))
             except (OSError, ValueError):
                 continue
+        if not snapshots:
+            return
         job = self.status(job_id, refresh=False)
         percent = round(processed * 100 / total, 1) if total else 0.0
-        stage = job.status
-        logs = []
-        for path in root.glob('**/eval_log.log'):
-            try:
-                logs.append(path.read_text(encoding='utf-8', errors='replace')[-12000:])
-            except OSError:
-                pass
-        log_text = '\n'.join(logs)
-        if 'Generating report' in log_text:
-            stage = 'generating_report'
-        elif 'aggregating scores' in log_text:
-            stage = 'scoring'
-        elif request.judge and f'Creating model {request.judge.model_id}' in log_text:
-            stage = 'running_judge'
-        elif 'Loading model for prediction' in log_text:
-            stage = 'running_model'
+        _, latest = max(snapshots, key=lambda item: item[0])
+        if latest.get('stage'):
+            stage, current_benchmark = self._progress_stage(latest, request, job.status)
+        else:
+            stage, current_benchmark = self._log_progress_fallback(root, job.status)
+            # Older EvalScope releases only persist the loading event while
+            # prediction is in progress. Once the global processed count moves
+            # beyond finalized reports, the current benchmark is generating.
+            if stage == 'loading_dataset' and processed > self._completed_sample_count(root):
+                stage = 'running_model'
         self._update(job_id, status=stage, progress=JobProgress(
-            current=processed, total=total or None, percent=percent, stage=stage,
+            current=processed, total=total or None, percent=percent,
+            current_benchmark=current_benchmark, stage=stage,
         ))
 
     def status(self, job_id: str, refresh: bool = True) -> EvaluationJob:

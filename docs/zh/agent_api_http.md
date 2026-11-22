@@ -155,7 +155,10 @@ curl -X POST http://<evalscope-host>:8001/v1/evaluations \
     "benchmarks": ["gsm8k"],
     "limit_per_subset": 3,
     "generation": {
-      "temperature": 0.0
+      "temperature": 0.0,
+      "timeout": 60,
+      "retries": 1,
+      "retry_interval": 0
     }
   }'
 ```
@@ -170,6 +173,11 @@ curl -X POST http://<evalscope-host>:8001/v1/evaluations \
 ```
 
 HTTP 请求不能指定 `work_dir`、`use_cache` 或服务器本地文件路径。输出目录由服务自动管理。
+
+`generation.timeout` 是单次模型调用尝试的超时时间，`generation.retries` 是总尝试次数，
+`generation.retry_interval` 是失败后再次尝试前的等待秒数。因此一次样本调用的最长等待时间
+大约为 `timeout × retries`，另加少量连接和清理开销。对响应较慢或成本敏感的服务，建议从
+`timeout=60, retries=1` 开始，再按实际稳定性增加重试。
 
 ## 9 查询状态
 

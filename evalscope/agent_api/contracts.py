@@ -56,6 +56,8 @@ class GenerationOptions(AgentApiModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(default=None, ge=1)
     timeout: Optional[float] = Field(default=None, gt=0.0)
+    retries: int = Field(default=3, ge=1, le=10)
+    retry_interval: int = Field(default=0, ge=0)
     stream: Optional[bool] = None
 
 

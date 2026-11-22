@@ -291,6 +291,22 @@ def _stop_process(process: mp.Process, cleanup_timeout: float) -> bool:
     return True
 
 
+def _has_all_expected_results(results: List[BenchmarkResult], expected: List[str]) -> bool:
+    """Return whether a recovered snapshot covers every requested benchmark."""
+
+    return set(expected).issubset({item.benchmark_id for item in results})
+
+
+def _merge_result_snapshots(*snapshots: List[BenchmarkResult]) -> List[BenchmarkResult]:
+    """Merge repeated snapshots, preferring the latest value for each benchmark."""
+
+    merged: Dict[str, BenchmarkResult] = {}
+    for snapshot in snapshots:
+        for item in snapshot:
+            merged[item.benchmark_id] = item
+    return list(merged.values())
+
+
 def _run_config_isolated(config: TaskConfig, task_timeout: float, cleanup_timeout: float, cancel_event=None):
     """Run EvalScope in a child process so sandbox/background resources cannot hang the API."""
 
@@ -310,12 +326,25 @@ def _run_config_isolated(config: TaskConfig, task_timeout: float, cleanup_timeou
             break
         except queue.Empty:
             recovered = recover_results(config.work_dir, minimum_mtime=started - 1.0)
-            if recovered:
+            # A multi-benchmark run is not complete when only its first report
+            # appears. Disk reports are a fallback for workers that finish the
+            # evaluation but hang during cleanup (not the primary result channel).
+            if _has_all_expected_results(recovered, list(config.datasets)):
                 break
 
-    if payload is None and not recovered and time.time() >= deadline:
+            # A worker normally reports success or failure through the queue.
+            # If it exits without doing so, stop waiting and let the final disk
+            # scan below decide whether anything can be recovered.
+            if not process.is_alive():
+                try:
+                    payload = output.get(timeout=0.5)
+                except queue.Empty:
+                    pass
+                break
+
+    timed_out = payload is None and time.time() >= deadline
+    if timed_out:
         _stop_process(process, cleanup_timeout)
-        raise TimeoutError(f'evaluation exceeded {task_timeout} seconds')
 
     process.join(timeout=cleanup_timeout)
     cleanup_timed_out = process.is_alive()
@@ -328,6 +357,19 @@ def _run_config_isolated(config: TaskConfig, task_timeout: float, cleanup_timeou
         results = [BenchmarkResult.model_validate(item) for item in payload['results']]
     else:
         results = recovered
+
+    # Reports can be written between the last polling pass and process cleanup.
+    # Always rescan once and merge by benchmark id so the caller never receives
+    # a stale first-report-only snapshot.
+    final_recovered = recover_results(config.work_dir, minimum_mtime=started - 1.0)
+    results = _merge_result_snapshots(results, final_recovered)
+
+    if timed_out and not _has_all_expected_results(results, list(config.datasets)):
+        raise TimeoutError(f'evaluation exceeded {task_timeout} seconds')
+    if payload is None and not _has_all_expected_results(results, list(config.datasets)):
+        raise RuntimeError(
+            f'evaluation worker exited without all expected results (exit code {process.exitcode})'
+        )
     return results, cleanup_timed_out
 
 

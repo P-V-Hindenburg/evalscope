@@ -9,7 +9,7 @@ from evalscope.agent_api import (
     resolve_credentials,
     validate_evaluation,
 )
-from evalscope.agent_api.adapter import _stop_process
+from evalscope.agent_api.adapter import _has_all_expected_results, _merge_result_snapshots, _stop_process
 from evalscope.agent_api.contracts import BenchmarkResult, MetricResult
 from evalscope.agent_api.results import sample_summary
 
@@ -71,6 +71,21 @@ def test_limit_name_is_explicitly_per_subset():
     assert config.limit == 10
 
 
+def test_generation_retry_controls_are_forwarded():
+    request = EvaluationRequest(
+        target=_target(), benchmarks=['pope'],
+        generation={'timeout': 60, 'retries': 1, 'retry_interval': 1},
+    )
+    plan = validate_evaluation(request)
+    credentials = resolve_credentials(request, lambda _: 'secret')
+
+    config = build_task_configs(plan, credentials, '/tmp/agent-api-test')[0]
+
+    assert config.generation_config.timeout == 60
+    assert config.generation_config.retries == 1
+    assert config.generation_config.retry_interval == 1
+
+
 def test_sample_summary_preserves_partial_success_counts():
     summary = sample_summary([BenchmarkResult(
         benchmark_id='docvqa', model_id='m',
@@ -110,3 +125,26 @@ def test_stop_process_escalates_when_worker_ignores_terminate():
     assert process.terminated == 1
     assert process.killed == 1
     assert process.is_alive() is False
+
+
+def test_recovery_requires_every_expected_benchmark():
+    gsm8k = BenchmarkResult(benchmark_id='gsm8k', model_id='m', metrics=[])
+    hellaswag = BenchmarkResult(benchmark_id='hellaswag', model_id='m', metrics=[])
+
+    assert not _has_all_expected_results([gsm8k], ['gsm8k', 'hellaswag'])
+    assert _has_all_expected_results([gsm8k, hellaswag], ['gsm8k', 'hellaswag'])
+
+
+def test_latest_recovery_snapshot_replaces_stale_result():
+    stale = BenchmarkResult(
+        benchmark_id='gsm8k', model_id='m', metrics=[], succeeded_samples=1,
+    )
+    final = BenchmarkResult(
+        benchmark_id='gsm8k', model_id='m', metrics=[], succeeded_samples=20,
+    )
+    other = BenchmarkResult(benchmark_id='hellaswag', model_id='m', metrics=[])
+
+    merged = _merge_result_snapshots([stale], [final, other])
+
+    assert {item.benchmark_id for item in merged} == {'gsm8k', 'hellaswag'}
+    assert next(item for item in merged if item.benchmark_id == 'gsm8k').succeeded_samples == 20
