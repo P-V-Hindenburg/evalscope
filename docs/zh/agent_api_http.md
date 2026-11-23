@@ -116,6 +116,9 @@ curl -H "Authorization: Bearer $EVALSCOPE_SERVICE_TOKEN" \
   http://<evalscope-host>:8001/v1/benchmarks/gsm8k
 ```
 
+单项详情中的 `subsets` 字段列出该 Benchmark 当前可选择的子集。提交评测时可以通过
+`benchmark_options.<benchmark_id>.subsets` 选择其中一个或多个子集。
+
 ## 7 运行前检查
 
 ```bash
@@ -179,6 +182,58 @@ HTTP 请求不能指定 `work_dir`、`use_cache` 或服务器本地文件路径�
 大约为 `timeout × retries`，另加少量连接和清理开销。对响应较慢或成本敏感的服务，建议从
 `timeout=60, retries=1` 开始，再按实际稳定性增加重试。
 
+### 8.1 全局每子集数量
+
+`limit_per_subset` 的含义是“每个被选中子集最多运行多少条”，不是整个 Benchmark 的总样本数。
+该语义与 EvalScope 原生 `TaskConfig.limit` 一致。
+
+```json
+{
+  "benchmarks": ["gsm8k", "pope", "mmmu"],
+  "limit_per_subset": 20
+}
+```
+
+如果 POPE 选择了3个子集，则每个子集最多20条；MMMU 同理。正式全量评测可以不传该字段。
+
+### 8.2 单 Benchmark 覆盖
+
+`benchmark_options` 可以为个别 Benchmark 覆盖全局数量，并选择子集：
+
+```json
+{
+  "benchmarks": ["gsm8k", "pope", "mmmu"],
+  "limit_per_subset": 20,
+  "benchmark_options": {
+    "pope": {
+      "limit_per_subset": 10,
+      "subsets": ["popular", "random"]
+    },
+    "mmmu": {
+      "limit_per_subset": 5,
+      "subsets": ["Accounting", "Biology"]
+    }
+  }
+}
+```
+
+最终配置为：GSM8K 使用全局值20；POPE 的 `popular`、`random` 各最多10条；MMMU 的
+`Accounting`、`Biology` 各最多5条。单项配置优先于全局配置。
+
+也可以不设置全局值，只为部分 Benchmark 单独设置数量；其他未设置数量的 Benchmark 将运行
+所选子集的全部数据。
+
+`benchmark_options` 的键必须同时出现在 `benchmarks` 中；`subsets` 不能留空或重复，且必须来自
+Benchmark 查询接口返回的 `subsets`。HTTP 接口不开放底层 `dataset_args`，避免调用方传入服务器
+本地路径或其他不安全配置。
+
+### 8.3 为什么保留全局字段
+
+现有调用方已经使用 `limit_per_subset`。本次增强不删除也不改变它的含义，只增加可选的
+`benchmark_options` 覆盖层，因此原有请求、脚本和 LangGraph Tool 无需修改即可继续运行。
+服务内部会按照数据源和最终 `limit_per_subset` 自动拆分执行组，最后仍返回一个 `job_id` 和一份
+统一结果；这种分组不会限制不同 Benchmark 使用不同数量。
+
 ## 9 查询状态
 
 ```bash
@@ -201,6 +256,30 @@ partial_success
 failed
 cancelled
 ```
+
+进度中同时返回样本和执行组两个层次：
+
+```json
+{
+  "progress": {
+    "current": 40,
+    "total": 80,
+    "percent": 50.0,
+    "total_is_estimate": true,
+    "current_benchmark": "gsm8k",
+    "completed_groups": 1,
+    "total_groups": 2,
+    "current_group": 2,
+    "current_group_benchmarks": ["gsm8k", "hellaswag"],
+    "stage": "running_model"
+  }
+}
+```
+
+- `total` 在任务开始时尽可能根据整数 `limit_per_subset` 和子集计算，之后不会因为进入下一执行组而跳变。
+- `total_is_estimate=true` 表示这是运行前上限；某些数据集的实际样本可能少于限制，任务结束时会用真实数量校准并变为 `false`。
+- 全量或比例限制无法在运行前精确计算时，`total` 保持 `null`，直到所有执行组的数量都已知，避免将第一组误当成整个任务。
+- `completed_groups/total_groups` 表示多数据源或多数量配置被拆成的执行组进度；它不改变最终仍返回一份合并结果的行为。
 
 ## 10 获取结果
 

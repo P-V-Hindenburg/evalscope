@@ -8,7 +8,7 @@ import socket
 import time
 from collections import defaultdict
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
 from pydantic import SecretStr
@@ -66,6 +66,18 @@ def validate_evaluation(request: EvaluationRequest) -> ResolvedEvaluationPlan:
         names = ', '.join(judge_benchmarks)
         raise EvaluationValidationError(f'judge profile required for benchmarks: {names}')
 
+    benchmark_by_id = {item.benchmark_id: item for item in benchmarks}
+    for benchmark_id, options in request.benchmark_options.items():
+        if options.subsets is None:
+            continue
+        available = benchmark_by_id[benchmark_id].subsets
+        unknown = sorted(set(options.subsets) - set(available))
+        if unknown:
+            raise EvaluationValidationError(
+                f'unknown subsets for benchmark {benchmark_id!r}: {", ".join(unknown)}; '
+                f'available subsets: {", ".join(available)}'
+            )
+
     benchmark_hubs = {item.benchmark_id: request.dataset_hub or item.default_dataset_hub for item in benchmarks}
     return ResolvedEvaluationPlan(
         request=request,
@@ -109,8 +121,30 @@ def _judge_config(request: EvaluationRequest, credentials: ResolvedCredentials) 
     )
 
 
-def _safe_group_name(dataset_hub: str) -> str:
-    return re.sub(r'[^a-zA-Z0-9_.-]+', '-', dataset_hub).strip('-') or 'default'
+def _safe_group_name(
+    dataset_hub: str,
+    limit: Optional[Union[int, float]],
+    *,
+    include_limit: bool,
+) -> str:
+    limit_name = 'full' if limit is None else str(limit).replace('.', '_')
+    raw = f'{dataset_hub}-limit-{limit_name}' if include_limit else dataset_hub
+    return re.sub(r'[^a-zA-Z0-9_.-]+', '-', raw).strip('-') or 'default'
+
+
+def _effective_limit(plan: ResolvedEvaluationPlan, benchmark_id: str) -> Optional[Union[int, float]]:
+    options = plan.request.benchmark_options.get(benchmark_id)
+    if options is not None and options.limit_per_subset is not None:
+        return options.limit_per_subset
+    return plan.request.limit_per_subset
+
+
+def _effective_dataset_args(plan: ResolvedEvaluationPlan, benchmark_id: str) -> Dict:
+    args = dict(plan.request.dataset_args.get(benchmark_id, {}))
+    options = plan.request.benchmark_options.get(benchmark_id)
+    if options is not None and options.subsets is not None:
+        args['subset_list'] = list(options.subsets)
+    return args
 
 
 def build_task_configs(
@@ -118,26 +152,40 @@ def build_task_configs(
     credentials: ResolvedCredentials,
     run_root: str,
 ) -> List[TaskConfig]:
-    """Build one TaskConfig per dataset hub so mixed-source requests remain deterministic."""
+    """Build native configs grouped by dataset hub and effective per-subset limit.
 
-    grouped: Dict[str, List[str]] = defaultdict(list)
+    Grouping is an execution detail only. Each benchmark first resolves its
+    request-wide default and optional benchmark-specific override.
+    """
+
+    GroupKey = Tuple[str, Optional[Union[int, float]]]
+    grouped: Dict[GroupKey, List[str]] = defaultdict(list)
     for benchmark_id, dataset_hub in plan.benchmark_hubs.items():
-        grouped[dataset_hub].append(benchmark_id)
+        grouped[(dataset_hub, _effective_limit(plan, benchmark_id))].append(benchmark_id)
 
     multiple_groups = len(grouped) > 1
+    groups_per_hub = {
+        hub: sum(1 for grouped_hub, _ in grouped if grouped_hub == hub)
+        for hub, _ in grouped
+    }
     configs = []
-    for dataset_hub, benchmarks in sorted(grouped.items()):
-        group_name = _safe_group_name(dataset_hub)
+    ordered_groups = sorted(grouped.items(), key=lambda item: (item[0][0], repr(item[0][1])))
+    for (dataset_hub, limit), benchmarks in ordered_groups:
+        group_name = _safe_group_name(
+            dataset_hub,
+            limit,
+            include_limit=groups_per_hub[dataset_hub] > 1,
+        )
         work_dir = os.path.join(run_root, group_name) if multiple_groups else run_root
         use_cache = plan.request.use_cache
         if use_cache and multiple_groups:
             use_cache = os.path.join(use_cache, group_name)
         sandbox_enabled = any(item.requires_sandbox for item in plan.benchmarks if item.benchmark_id in benchmarks)
-        dataset_args = {
-            name: dict(plan.request.dataset_args.get(name, {}))
-            for name in benchmarks
-            if name in plan.request.dataset_args
-        }
+        dataset_args = {}
+        for name in benchmarks:
+            args = _effective_dataset_args(plan, name)
+            if args:
+                dataset_args[name] = args
         for item in plan.benchmarks:
             if item.benchmark_id in benchmarks and item.requires_sandbox:
                 dataset_args.setdefault(item.benchmark_id, {})['review_timeout'] = (
@@ -153,7 +201,7 @@ def build_task_configs(
                 datasets=benchmarks,
                 dataset_args=dataset_args,
                 dataset_hub=dataset_hub,
-                limit=plan.request.limit_per_subset,
+                limit=limit,
                 generation_config=plan.request.generation.model_dump(exclude_none=True),
                 eval_batch_size=plan.request.eval_batch_size,
                 ignore_errors=plan.request.ignore_errors,
@@ -168,6 +216,26 @@ def build_task_configs(
             )
         )
     return configs
+
+
+def _planned_sample_total(plan: ResolvedEvaluationPlan, configs: List[TaskConfig]) -> Optional[int]:
+    """Return a stable upper-bound sample total when every group uses an integer limit.
+
+    EvalScope resolves the exact count after loading each dataset. Until then,
+    an integer limit and the selected subset list provide a deterministic plan.
+    Full-dataset and fractional runs deliberately remain unknown.
+    """
+
+    benchmark_by_id = {item.benchmark_id: item for item in plan.benchmarks}
+    total = 0
+    for config in configs:
+        if not isinstance(config.limit, int) or isinstance(config.limit, bool):
+            return None
+        for benchmark_id in config.datasets:
+            configured_subsets = config.dataset_args.get(benchmark_id, {}).get('subset_list')
+            subsets = configured_subsets or benchmark_by_id[benchmark_id].subsets or ['default']
+            total += config.limit * len(subsets)
+    return total
 
 
 def _run_id() -> str:
@@ -210,7 +278,7 @@ def _classify_error(exc: Exception, benchmarks: List[str]) -> EvaluationError:
             benchmarks=benchmarks,
             retryable=True,
         )
-    if 'timed out' in lowered or 'timeout' in lowered:
+    if 'timed out' in lowered or 'timeout' in lowered or 'exceeded' in lowered:
         return EvaluationError(
             code='TASK_TIMEOUT',
             stage='execution',
@@ -311,8 +379,12 @@ def _run_config_isolated(config: TaskConfig, task_timeout: float, cleanup_timeou
     """Run EvalScope in a child process so sandbox/background resources cannot hang the API."""
 
     started = time.time()
-    output: mp.Queue = mp.Queue()
-    process = mp.Process(target=_run_task_worker, args=(config, output), daemon=True)
+    # Jobs are launched from a ThreadPoolExecutor. Forking a multi-threaded
+    # server can inherit a locked mutex and deadlock before EvalScope starts;
+    # spawn creates a clean interpreter and is the safe cross-platform model.
+    context = mp.get_context('spawn')
+    output = context.Queue()
+    process = context.Process(target=_run_task_worker, args=(config, output), daemon=True)
     process.start()
     deadline = started + task_timeout
     payload = None
@@ -379,6 +451,7 @@ def run_evaluation(
     run_id: Optional[str] = None,
     cancel_event=None,
     stage_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> EvaluationResult:
     """Run a logical evaluation synchronously and return normalized, agent-safe results."""
 
@@ -389,13 +462,25 @@ def run_evaluation(
     resolved_run_id = run_id or _run_id()
     run_root = request.work_dir or os.path.join('outputs', 'agent-api', resolved_run_id)
     configs = build_task_configs(plan, credentials, run_root)
+    if progress_callback:
+        progress_callback({
+            'event': 'plan',
+            'total_groups': len(configs),
+            'planned_samples': _planned_sample_total(plan, configs),
+        })
 
     result_groups = []
     artifacts: List[ArtifactRefs] = []
     errors = []
-    for config in configs:
+    for group_index, config in enumerate(configs, start=1):
         if cancel_event is not None and cancel_event.is_set():
             raise EvaluationCancelledError('evaluation cancelled by caller')
+        if progress_callback:
+            progress_callback({
+                'event': 'group_started',
+                'group_index': group_index,
+                'benchmarks': list(config.datasets),
+            })
         artifacts.append(artifact_refs(config.work_dir))
         try:
             if stage_callback:
@@ -427,6 +512,11 @@ def run_evaluation(
             recovered = recover_results(config.work_dir)
             if recovered:
                 result_groups.append(recovered)
+        if progress_callback:
+            progress_callback({
+                'event': 'group_completed',
+                'completed_groups': group_index,
+            })
 
     benchmarks = merge_results(result_groups)
     substantive_errors = [error for error in errors if error.stage != 'cleanup']

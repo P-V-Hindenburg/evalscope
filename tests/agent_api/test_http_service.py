@@ -110,6 +110,39 @@ def test_submit_returns_job_id_without_accepting_server_paths():
     assert response.status_code == 422
 
 
+def test_http_accepts_safe_per_benchmark_limit_and_subset_overrides():
+    payload = _payload()
+    payload['target']['modality'] = 'multimodal'
+    payload['benchmarks'] = ['pope']
+    payload['benchmark_options'] = {
+        'pope': {
+            'limit_per_subset': 2,
+            'subsets': ['popular', 'random'],
+        }
+    }
+
+    class CapturingJobManager(FakeJobManager):
+        def submit(self, request, resolver):
+            assert request.benchmark_options['pope'].limit_per_subset == 2
+            assert request.benchmark_options['pope'].subsets == ['popular', 'random']
+            return self.job.job_id
+
+    settings = ServiceSettings(
+        service_token='service-secret',
+        allowed_endpoint_hosts=frozenset({'example.test'}),
+    )
+    client = TestClient(create_app(
+        settings=settings,
+        credential_resolver=lambda _: 'secret',
+        job_manager=CapturingJobManager(),
+    ))
+
+    response = client.post('/v1/evaluations', headers=_headers(), json=payload)
+
+    assert response.status_code == 202
+    assert response.json()['job_id'] == 'eval_test'
+
+
 def test_status_and_pending_result_are_separate():
     client = _client()
 

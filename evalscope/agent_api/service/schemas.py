@@ -6,6 +6,7 @@ from typing import Any, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..contracts import (
+    BenchmarkOptions,
     EvaluationRequest,
     GenerationOptions,
     JudgeProfile,
@@ -31,6 +32,7 @@ class HttpEvaluationRequest(HttpApiModel):
     target: ModelTarget
     benchmarks: List[str] = Field(min_length=1)
     limit_per_subset: Optional[int | float] = None
+    benchmark_options: dict[str, BenchmarkOptions] = Field(default_factory=dict)
     dataset_hub: Optional[Literal['modelscope', 'huggingface']] = None
     generation: GenerationOptions = Field(default_factory=GenerationOptions)
     runtime: RuntimeOptions = Field(default_factory=RuntimeOptions)

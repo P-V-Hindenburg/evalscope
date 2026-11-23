@@ -20,6 +20,7 @@ from .jobs import (
 from .preflight import preflight_evaluation
 from .contracts import (
     BenchmarkInfo,
+    BenchmarkOptions,
     BenchmarkResult,
     EvaluationError,
     EvaluationRequest,
@@ -36,6 +37,7 @@ from .contracts import (
 
 __all__ = [
     'BenchmarkInfo',
+    'BenchmarkOptions',
     'BenchmarkNotFoundError',
     'BenchmarkResult',
     'CredentialResolver',

@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timezone
 
 from evalscope.agent_api import EvaluationRequest, ModelTarget
-from evalscope.agent_api.jobs import EvaluationJob, EvaluationJobManager
+from evalscope.agent_api.jobs import EvaluationJob, EvaluationJobManager, JobProgress
 
 
 def test_cancel_queued_job():
@@ -51,6 +51,110 @@ def test_progress_uses_native_progress_tree(tmp_path):
     assert job.progress.total == 20
     assert job.progress.percent == 35.0
     assert job.progress.current_benchmark == 'gsm8k'
+
+
+def test_multi_group_progress_keeps_planned_total_stable(tmp_path):
+    manager = EvaluationJobManager(max_workers=1)
+    request = EvaluationRequest(
+        target=ModelTarget(model_id='m', api_url='https://example.test/v1', credential_ref='k'),
+        benchmarks=['pope', 'gsm8k', 'hellaswag'],
+        work_dir=str(tmp_path),
+    )
+    job_id = 'eval_multi_group_progress'
+    now = datetime.now(timezone.utc)
+    manager._jobs[job_id] = EvaluationJob(
+        job_id=job_id,
+        status='running_model',
+        created_at=now,
+        updated_at=now,
+        progress=JobProgress(
+            total=80,
+            total_is_estimate=True,
+            total_groups=2,
+            current_group=1,
+            current_group_benchmarks=['pope'],
+        ),
+    )
+    manager._requests[job_id] = request
+    first = tmp_path / 'first'
+    first.mkdir()
+    (first / 'progress.json').write_text(json.dumps({
+        'status': 'running', 'processed_count': 15, 'total_count': 30,
+    }), encoding='utf-8')
+
+    manager._refresh_progress(job_id)
+    job = manager.status(job_id, refresh=False)
+    assert job.progress.current == 15
+    assert job.progress.total == 80
+    assert job.progress.percent == 18.8
+    assert job.progress.total_is_estimate
+    assert job.progress.total_groups == 2
+    assert job.progress.current_group == 1
+
+    second = tmp_path / 'second'
+    second.mkdir()
+    (first / 'progress.json').write_text(json.dumps({
+        'status': 'finished', 'processed_count': 30, 'total_count': 30,
+    }), encoding='utf-8')
+    (second / 'progress.json').write_text(json.dumps({
+        'status': 'running', 'processed_count': 10, 'total_count': 50,
+    }), encoding='utf-8')
+    manager._apply_progress_event(job_id, {
+        'event': 'group_completed', 'completed_groups': 1,
+    })
+    manager._apply_progress_event(job_id, {
+        'event': 'group_started', 'group_index': 2, 'benchmarks': ['gsm8k', 'hellaswag'],
+    })
+
+    manager._refresh_progress(job_id)
+    job = manager.status(job_id, refresh=False)
+    assert job.progress.current == 40
+    assert job.progress.total == 80
+    assert job.progress.percent == 50.0
+    assert job.progress.completed_groups == 1
+    assert job.progress.current_group == 2
+    assert job.progress.current_group_benchmarks == ['gsm8k', 'hellaswag']
+
+
+def test_unknown_multi_group_total_stays_null_until_all_groups_exist(tmp_path):
+    manager = EvaluationJobManager(max_workers=1)
+    request = EvaluationRequest(
+        target=ModelTarget(model_id='m', api_url='https://example.test/v1', credential_ref='k'),
+        benchmarks=['gsm8k', 'hellaswag'],
+        work_dir=str(tmp_path),
+    )
+    job_id = 'eval_unknown_total'
+    now = datetime.now(timezone.utc)
+    manager._jobs[job_id] = EvaluationJob(
+        job_id=job_id,
+        status='running_model',
+        created_at=now,
+        updated_at=now,
+        progress=JobProgress(total_groups=2),
+    )
+    manager._requests[job_id] = request
+    first = tmp_path / 'first'
+    first.mkdir()
+    (first / 'progress.json').write_text(json.dumps({
+        'status': 'running', 'processed_count': 4, 'total_count': 10,
+    }), encoding='utf-8')
+
+    manager._refresh_progress(job_id)
+    job = manager.status(job_id, refresh=False)
+    assert job.progress.current == 4
+    assert job.progress.total is None
+    assert job.progress.percent == 0.0
+
+    second = tmp_path / 'second'
+    second.mkdir()
+    (second / 'progress.json').write_text(json.dumps({
+        'status': 'running', 'processed_count': 5, 'total_count': 10,
+    }), encoding='utf-8')
+    manager._refresh_progress(job_id)
+    job = manager.status(job_id, refresh=False)
+    assert job.progress.current == 9
+    assert job.progress.total == 20
+    assert job.progress.percent == 45.0
 
 
 def test_progress_falls_back_to_latest_log_event(tmp_path):

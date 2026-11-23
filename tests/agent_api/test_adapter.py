@@ -9,7 +9,13 @@ from evalscope.agent_api import (
     resolve_credentials,
     validate_evaluation,
 )
-from evalscope.agent_api.adapter import _has_all_expected_results, _merge_result_snapshots, _stop_process
+from evalscope.agent_api.adapter import (
+    _classify_error,
+    _has_all_expected_results,
+    _merge_result_snapshots,
+    _planned_sample_total,
+    _stop_process,
+)
 from evalscope.agent_api.contracts import BenchmarkResult, MetricResult
 from evalscope.agent_api.results import sample_summary
 
@@ -71,6 +77,112 @@ def test_limit_name_is_explicitly_per_subset():
     assert config.limit == 10
 
 
+def test_per_benchmark_limit_overrides_request_default_without_changing_others():
+    request = EvaluationRequest(
+        target=_target(),
+        benchmarks=['gsm8k', 'hellaswag', 'pope'],
+        limit_per_subset=20,
+        benchmark_options={'pope': {'limit_per_subset': 10}},
+    )
+    plan = validate_evaluation(request)
+    credentials = resolve_credentials(request, lambda _: 'secret')
+
+    configs = build_task_configs(plan, credentials, '/tmp/agent-api-test')
+
+    assert len(configs) == 2
+    by_limit = {config.limit: config for config in configs}
+    assert by_limit[20].datasets == ['gsm8k', 'hellaswag']
+    assert by_limit[10].datasets == ['pope']
+    assert by_limit[20].work_dir.endswith('modelscope-limit-20')
+    assert by_limit[10].work_dir.endswith('modelscope-limit-10')
+
+
+def test_per_benchmark_subsets_use_native_dataset_args():
+    request = EvaluationRequest(
+        target=_target(),
+        benchmarks=['pope'],
+        limit_per_subset=20,
+        benchmark_options={
+            'pope': {
+                'subsets': ['popular', 'random'],
+                'limit_per_subset': 10,
+            }
+        },
+    )
+    plan = validate_evaluation(request)
+    credentials = resolve_credentials(request, lambda _: 'secret')
+
+    config = build_task_configs(plan, credentials, '/tmp/agent-api-test')[0]
+
+    assert config.limit == 10
+    assert config.dataset_args['pope']['subset_list'] == ['popular', 'random']
+
+
+def test_planned_total_combines_group_limits_and_selected_subsets():
+    request = EvaluationRequest(
+        target=_target(),
+        benchmarks=['gsm8k', 'hellaswag', 'pope'],
+        limit_per_subset=25,
+        benchmark_options={
+            'pope': {'subsets': ['popular', 'random'], 'limit_per_subset': 15},
+        },
+    )
+    plan = validate_evaluation(request)
+    credentials = resolve_credentials(request, lambda _: 'secret')
+    configs = build_task_configs(plan, credentials, '/tmp/agent-api-test')
+
+    assert _planned_sample_total(plan, configs) == 80
+
+
+def test_request_rejects_options_for_unselected_benchmark():
+    with pytest.raises(ValueError, match='not selected'):
+        EvaluationRequest(
+            target=_target(),
+            benchmarks=['gsm8k'],
+            benchmark_options={'pope': {'limit_per_subset': 10}},
+        )
+
+
+def test_request_rejects_conflicting_subset_sources():
+    with pytest.raises(ValueError, match='conflicting subset selection'):
+        EvaluationRequest(
+            target=_target(),
+            benchmarks=['pope'],
+            benchmark_options={'pope': {'subsets': ['popular']}},
+            dataset_args={'pope': {'subset_list': ['random']}},
+        )
+
+
+@pytest.mark.parametrize('limit', [0, -1, 1.5, True])
+def test_request_rejects_invalid_per_benchmark_limit(limit):
+    with pytest.raises(ValueError, match='limit_per_subset'):
+        EvaluationRequest(
+            target=_target(),
+            benchmarks=['pope'],
+            benchmark_options={'pope': {'limit_per_subset': limit}},
+        )
+
+
+def test_request_rejects_duplicate_subsets():
+    with pytest.raises(ValueError, match='subsets must not contain duplicates'):
+        EvaluationRequest(
+            target=_target(),
+            benchmarks=['pope'],
+            benchmark_options={'pope': {'subsets': ['popular', 'popular']}},
+        )
+
+
+def test_validation_rejects_unknown_subset():
+    request = EvaluationRequest(
+        target=_target(),
+        benchmarks=['pope'],
+        benchmark_options={'pope': {'subsets': ['not-a-pope-subset']}},
+    )
+
+    with pytest.raises(EvaluationValidationError, match='unknown subsets'):
+        validate_evaluation(request)
+
+
 def test_generation_retry_controls_are_forwarded():
     request = EvaluationRequest(
         target=_target(), benchmarks=['pope'],
@@ -84,6 +196,14 @@ def test_generation_retry_controls_are_forwarded():
     assert config.generation_config.timeout == 60
     assert config.generation_config.retries == 1
     assert config.generation_config.retry_interval == 1
+
+
+def test_exceeded_task_deadline_is_classified_as_retryable_timeout():
+    error = _classify_error(TimeoutError('evaluation exceeded 1800.0 seconds'), ['mmmu'])
+
+    assert error.code == 'TASK_TIMEOUT'
+    assert error.category == 'timeout'
+    assert error.retryable is True
 
 
 def test_sample_summary_preserves_partial_success_counts():

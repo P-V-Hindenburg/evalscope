@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 
 class AgentApiModel(BaseModel):
@@ -71,12 +71,47 @@ class RuntimeOptions(AgentApiModel):
     minimum_free_disk_bytes: int = Field(default=1_073_741_824, ge=0)
 
 
+def _validate_limit_per_subset(value: Optional[int | float]) -> Optional[int | float]:
+    if value is None:
+        return value
+    if isinstance(value, bool) or value <= 0:
+        raise ValueError('limit_per_subset must be positive')
+    if isinstance(value, float) and value > 1:
+        raise ValueError('a float limit_per_subset must be a fraction in (0, 1]')
+    return value
+
+
+class BenchmarkOptions(AgentApiModel):
+    """Safe per-benchmark overrides layered on top of request defaults."""
+
+    subsets: Optional[List[str]] = None
+    limit_per_subset: Optional[int | float] = None
+
+    @field_validator('subsets')
+    @classmethod
+    def _validate_subsets(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return value
+        cleaned = [item.strip() for item in value if item.strip()]
+        if not cleaned:
+            raise ValueError('subsets must contain at least one non-empty name')
+        if len(cleaned) != len(set(cleaned)):
+            raise ValueError('subsets must not contain duplicates')
+        return cleaned
+
+    @field_validator('limit_per_subset', mode='before')
+    @classmethod
+    def _validate_limit(cls, value: Optional[int | float]) -> Optional[int | float]:
+        return _validate_limit_per_subset(value)
+
+
 class EvaluationRequest(AgentApiModel):
     """Agent-facing request for one logical evaluation."""
 
     target: ModelTarget
     benchmarks: List[str] = Field(min_length=1)
     limit_per_subset: Optional[int | float] = None
+    benchmark_options: Dict[str, BenchmarkOptions] = Field(default_factory=dict)
     dataset_hub: Optional[Literal['modelscope', 'huggingface']] = None
     dataset_args: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     generation: GenerationOptions = Field(default_factory=GenerationOptions)
@@ -99,16 +134,27 @@ class EvaluationRequest(AgentApiModel):
             raise ValueError('benchmarks must not contain duplicates')
         return cleaned
 
-    @field_validator('limit_per_subset')
+    @field_validator('limit_per_subset', mode='before')
     @classmethod
     def _validate_limit(cls, value: Optional[int | float]) -> Optional[int | float]:
-        if value is None:
-            return value
-        if isinstance(value, bool) or value <= 0:
-            raise ValueError('limit_per_subset must be positive')
-        if isinstance(value, float) and value > 1:
-            raise ValueError('a float limit_per_subset must be a fraction in (0, 1]')
-        return value
+        return _validate_limit_per_subset(value)
+
+    @model_validator(mode='after')
+    def _validate_benchmark_options(self):
+        unknown = sorted(set(self.benchmark_options) - set(self.benchmarks))
+        if unknown:
+            raise ValueError(
+                'benchmark_options contains benchmarks not selected by benchmarks: '
+                + ', '.join(unknown)
+            )
+        for benchmark_id, options in self.benchmark_options.items():
+            configured = self.dataset_args.get(benchmark_id, {}).get('subset_list')
+            if options.subsets is not None and configured is not None and list(configured) != options.subsets:
+                raise ValueError(
+                    f'conflicting subset selection for {benchmark_id!r}: '
+                    'use benchmark_options.subsets or dataset_args.subset_list, not both'
+                )
+        return self
 
 
 class ResolvedEvaluationPlan(AgentApiModel):

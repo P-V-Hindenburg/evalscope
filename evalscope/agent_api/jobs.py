@@ -24,7 +24,12 @@ class JobProgress(BaseModel):
     current: int = 0
     total: Optional[int] = None
     percent: float = 0.0
+    total_is_estimate: bool = False
     current_benchmark: Optional[str] = None
+    completed_groups: int = 0
+    total_groups: Optional[int] = None
+    current_group: Optional[int] = None
+    current_group_benchmarks: list[str] = Field(default_factory=list)
     stage: JobStatus = 'queued'
 
 
@@ -70,6 +75,7 @@ class EvaluationJobManager:
                 request, resolver, run_id=job_id,
                 cancel_event=self._cancel_events[job_id],
                 stage_callback=lambda stage: self._set_stage(job_id, stage),
+                progress_callback=lambda event: self._apply_progress_event(job_id, event),
             )
             self._refresh_progress(job_id)
             job = self.status(job_id, refresh=False)
@@ -78,7 +84,11 @@ class EvaluationJobManager:
                 'current': total if total is not None else job.progress.current,
                 'total': total,
                 'percent': 100.0,
+                'total_is_estimate': False,
                 'current_benchmark': None,
+                'completed_groups': job.progress.total_groups or job.progress.completed_groups,
+                'current_group': None,
+                'current_group_benchmarks': [],
                 'stage': result.status,
             })
             self._update(job_id, status=result.status, result=result, progress=terminal_progress)
@@ -92,10 +102,51 @@ class EvaluationJobManager:
             current = self._jobs[job_id]
             self._jobs[job_id] = current.model_copy(update={**changes, 'updated_at': datetime.now(timezone.utc)})
 
+    def _update_progress(self, job_id: str, **changes) -> None:
+        """Atomically merge progress events without losing concurrent polling updates."""
+
+        with self._lock:
+            current = self._jobs[job_id]
+            progress = current.progress.model_copy(update=changes)
+            self._jobs[job_id] = current.model_copy(update={
+                'progress': progress,
+                'updated_at': datetime.now(timezone.utc),
+            })
+
+    def _apply_progress_event(self, job_id: str, event: dict) -> None:
+        event_name = event.get('event')
+        if event_name == 'plan':
+            planned = event.get('planned_samples')
+            self._update_progress(
+                job_id,
+                total=planned,
+                total_is_estimate=planned is not None,
+                total_groups=event.get('total_groups'),
+            )
+        elif event_name == 'group_started':
+            self._update_progress(
+                job_id,
+                current_group=event.get('group_index'),
+                current_group_benchmarks=list(event.get('benchmarks') or []),
+            )
+        elif event_name == 'group_completed':
+            self._update_progress(
+                job_id,
+                completed_groups=int(event.get('completed_groups') or 0),
+                current_group=None,
+                current_group_benchmarks=[],
+            )
+
     def _set_terminal(self, job_id: str, status: JobStatus, message: Optional[str] = None) -> None:
         self._refresh_progress(job_id)
         job = self.status(job_id, refresh=False)
-        progress = job.progress.model_copy(update={'stage': status, 'current_benchmark': None})
+        progress = job.progress.model_copy(update={
+            'stage': status,
+            'total_is_estimate': False,
+            'current_benchmark': None,
+            'current_group': None,
+            'current_group_benchmarks': [],
+        })
         self._update(job_id, status=status, message=message, progress=progress)
 
     @staticmethod
@@ -184,7 +235,21 @@ class EvaluationJobManager:
         if not snapshots:
             return
         job = self.status(job_id, refresh=False)
-        percent = round(processed * 100 / total, 1) if total else 0.0
+        # A multi-group task must not advertise the first group's total as the
+        # whole task total. Prefer the stable plan total. If it is unknowable
+        # (full/fractional datasets), expose no total until all groups exist.
+        if job.progress.total is not None:
+            display_total = job.progress.total
+            total_is_estimate = job.progress.total_is_estimate
+        elif job.progress.total_groups is not None and len(snapshots) < job.progress.total_groups:
+            display_total = None
+            total_is_estimate = False
+        else:
+            display_total = total or None
+            total_is_estimate = False
+        percent = round(processed * 100 / display_total, 1) if display_total else 0.0
+        if total_is_estimate:
+            percent = min(percent, 99.9)
         _, latest = max(snapshots, key=lambda item: item[0])
         if latest.get('stage'):
             stage, current_benchmark = self._progress_stage(latest, request, job.status)
@@ -195,10 +260,14 @@ class EvaluationJobManager:
             # beyond finalized reports, the current benchmark is generating.
             if stage == 'loading_dataset' and processed > self._completed_sample_count(root):
                 stage = 'running_model'
-        self._update(job_id, status=stage, progress=JobProgress(
-            current=processed, total=total or None, percent=percent,
-            current_benchmark=current_benchmark, stage=stage,
-        ))
+        self._update(job_id, status=stage, progress=job.progress.model_copy(update={
+            'current': processed,
+            'total': display_total,
+            'percent': percent,
+            'total_is_estimate': total_is_estimate,
+            'current_benchmark': current_benchmark,
+            'stage': stage,
+        }))
 
     def status(self, job_id: str, refresh: bool = True) -> EvaluationJob:
         with self._lock:
