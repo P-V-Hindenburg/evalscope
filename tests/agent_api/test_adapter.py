@@ -1,4 +1,5 @@
 import pytest
+from types import SimpleNamespace
 
 from evalscope.agent_api import (
     EvaluationRequest,
@@ -7,9 +8,11 @@ from evalscope.agent_api import (
     ModelTarget,
     build_task_configs,
     resolve_credentials,
+    run_evaluation,
     validate_evaluation,
 )
 from evalscope.agent_api.adapter import (
+    build_benchmark_task_configs,
     _classify_error,
     _has_all_expected_results,
     _merge_result_snapshots,
@@ -65,6 +68,73 @@ def test_task_configs_split_mixed_dataset_hubs_and_enable_sandbox():
     assert by_hub['huggingface'].sandbox.enabled is False
     assert by_hub['modelscope'].api_key.get_secret_value() == 'secret-for-target-key'
     assert by_hub['modelscope'].judge.strategy == 'auto'
+
+
+def test_benchmark_execution_configs_are_isolated_and_keep_request_order():
+    request = EvaluationRequest(
+        target=_target(),
+        benchmarks=['pope', 'gsm8k', 'humaneval'],
+        limit_per_subset=3,
+    )
+    plan = validate_evaluation(request)
+    credentials = resolve_credentials(request, lambda _: 'secret')
+
+    configs = build_benchmark_task_configs(plan, credentials, '/tmp/agent-api-isolated')
+
+    assert [config.datasets for config in configs] == [['pope'], ['gsm8k'], ['humaneval']]
+    assert [config.work_dir for config in configs] == [
+        '/tmp/agent-api-isolated/pope',
+        '/tmp/agent-api-isolated/gsm8k',
+        '/tmp/agent-api-isolated/humaneval',
+    ]
+    assert configs[0].sandbox is None
+    assert configs[2].sandbox.enabled is True
+
+
+def test_logical_run_continues_after_one_benchmark_fails(monkeypatch, tmp_path):
+    request = EvaluationRequest(
+        target=_target('text'),
+        benchmarks=['gsm8k', 'hellaswag'],
+        limit_per_subset=1,
+        work_dir=str(tmp_path),
+    )
+    configs = [
+        SimpleNamespace(
+            datasets=[name],
+            work_dir=str(tmp_path / name),
+            limit=1,
+            dataset_args={},
+        )
+        for name in request.benchmarks
+    ]
+
+    monkeypatch.setattr('evalscope.agent_api.adapter.build_benchmark_task_configs', lambda *_: configs)
+    monkeypatch.setattr('evalscope.agent_api.adapter.recover_results', lambda *_args, **_kwargs: [])
+
+    def fake_run(config, **_kwargs):
+        if config.datasets == ['gsm8k']:
+            raise RuntimeError('synthetic benchmark failure')
+        return [BenchmarkResult(
+            benchmark_id='hellaswag',
+            model_id='test-model',
+            metrics=[MetricResult(name='accuracy', score=1.0, num=1, is_primary=True)],
+            requested_samples=1,
+            processed_samples=1,
+            succeeded_samples=1,
+            errored_samples=0,
+        )], False
+
+    monkeypatch.setattr('evalscope.agent_api.adapter._run_config_isolated', fake_run)
+
+    result = run_evaluation(request, lambda _: 'secret')
+    by_id = {item.benchmark_id: item for item in result.benchmarks}
+
+    assert result.status == 'partial_success'
+    assert by_id['gsm8k'].status == 'failed'
+    assert by_id['gsm8k'].requested_samples == 1
+    assert by_id['gsm8k'].processed_samples == 0
+    assert by_id['hellaswag'].status == 'completed'
+    assert result.errors[0].benchmarks == ['gsm8k']
 
 
 def test_limit_name_is_explicitly_per_subset():
@@ -213,6 +283,7 @@ def test_sample_summary_preserves_partial_success_counts():
         requested_samples=10, succeeded_samples=9, errored_samples=1, incomplete=True,
     )])
     assert summary.planned == 10
+    assert summary.processed == 10
     assert summary.successful == 9
     assert summary.failed == 1
     assert summary.scored == 9

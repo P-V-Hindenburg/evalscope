@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..contracts import (
     BenchmarkOptions,
@@ -13,7 +13,8 @@ from ..contracts import (
     ModelTarget,
     RuntimeOptions,
 )
-from ..jobs import EvaluationJob, JobProgress, JobStatus
+from ..events import RunEvent
+from ..jobs import BenchmarkJobState, EvaluationJob, JobProgress, JobStatus
 
 
 class HttpApiModel(BaseModel):
@@ -64,6 +65,7 @@ class EvaluationStatusResponse(HttpApiModel):
     created_at: datetime
     updated_at: datetime
     progress: JobProgress
+    benchmarks: List[BenchmarkJobState] = Field(default_factory=list)
     result_available: bool = False
     message: Optional[str] = None
 
@@ -77,6 +79,7 @@ class EvaluationStatusResponse(HttpApiModel):
             created_at=job.created_at,
             updated_at=job.updated_at,
             progress=job.progress,
+            benchmarks=job.benchmarks,
             result_available=job.result is not None,
             message=job.message,
         )
@@ -92,6 +95,27 @@ class CancellationResponse(HttpApiModel):
     job_id: str
     accepted: bool
     status: Literal['cancellation_requested'] = 'cancellation_requested'
+
+
+class PartialCancellationRequest(HttpApiModel):
+    benchmarks: List[str] = Field(min_length=1)
+
+    @field_validator('benchmarks')
+    @classmethod
+    def _unique_benchmarks(cls, value: List[str]) -> List[str]:
+        cleaned = [item.strip() for item in value if item.strip()]
+        if not cleaned:
+            raise ValueError('at least one benchmark is required')
+        if len(cleaned) != len(set(cleaned)):
+            raise ValueError('benchmarks must not contain duplicates')
+        return cleaned
+
+
+class EventPageResponse(HttpApiModel):
+    job_id: str
+    events: List[RunEvent]
+    next_cursor: int
+    has_more: bool
 
 
 class ApiError(HttpApiModel):

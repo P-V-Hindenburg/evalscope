@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 
 from evalscope.agent_api.jobs import EvaluationJob, JobProgress
+from evalscope.agent_api.events import EventPage, RunEvent
 from evalscope.agent_api.service.app import create_app
 from evalscope.agent_api.service.credentials import CredentialReferenceError
 from evalscope.agent_api.service.settings import ServiceSettings
@@ -29,10 +30,25 @@ class FakeJobManager:
             raise KeyError(job_id)
         return self.job
 
-    def cancel(self, job_id):
+    def cancel(self, job_id, benchmarks=None):
         if job_id != self.job.job_id:
             raise KeyError(job_id)
         return True
+
+    def events(self, job_id, after_cursor=0, limit=100):
+        if job_id != self.job.job_id:
+            raise KeyError(job_id)
+        return EventPage(
+            job_id=job_id,
+            events=[RunEvent(
+                sequence=1,
+                timestamp=datetime.now(timezone.utc),
+                type='job.queued',
+                message='queued',
+            )] if after_cursor == 0 else [],
+            next_cursor=1 if after_cursor == 0 else after_cursor,
+            has_more=False,
+        )
 
 
 def _client(credential_resolver=None):
@@ -174,6 +190,41 @@ def test_cancel_returns_acknowledgement():
 
     assert response.status_code == 202
     assert response.json()['accepted'] is True
+
+
+def test_partial_cancel_and_incremental_events():
+    client = _client()
+
+    cancelled = client.post(
+        '/v1/evaluations/eval_test/cancellations',
+        headers=_headers(),
+        json={'benchmarks': ['gsm8k']},
+    )
+    events = client.get(
+        '/v1/evaluations/eval_test/events?after_cursor=0&limit=10',
+        headers=_headers(),
+    )
+    no_new_events = client.get(
+        '/v1/evaluations/eval_test/events?after_cursor=1&limit=10',
+        headers=_headers(),
+    )
+
+    assert cancelled.status_code == 202
+    assert events.status_code == 200
+    assert events.json()['events'][0]['sequence'] == 1
+    assert events.json()['next_cursor'] == 1
+    assert no_new_events.json()['events'] == []
+    assert no_new_events.json()['next_cursor'] == 1
+
+
+def test_partial_cancel_rejects_duplicate_benchmark_ids():
+    response = _client().post(
+        '/v1/evaluations/eval_test/cancellations',
+        headers=_headers(),
+        json={'benchmarks': ['gsm8k', 'gsm8k']},
+    )
+
+    assert response.status_code == 422
 
 
 def test_unknown_credential_reference_fails_before_queueing():

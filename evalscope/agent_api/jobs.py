@@ -6,17 +6,22 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Literal, Optional
+from typing import Dict, List, Literal, Optional
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .adapter import CredentialResolver, EvaluationCancelledError, run_evaluation
 from .contracts import EvaluationRequest, EvaluationResult
+from .events import EventPage, JobEventStore
 
 JobStatus = Literal[
     'queued', 'validating', 'loading_dataset', 'running_model', 'running_judge',
-    'scoring', 'generating_report', 'completed', 'partial_success', 'failed', 'cancelled'
+    'scoring', 'generating_report', 'cancellation_requested',
+    'completed', 'partial_success', 'failed', 'cancelled'
+]
+BenchmarkJobStatus = Literal[
+    'queued', 'running', 'cancellation_requested', 'completed', 'partial_success', 'failed', 'cancelled'
 ]
 
 
@@ -33,6 +38,16 @@ class JobProgress(BaseModel):
     stage: JobStatus = 'queued'
 
 
+class BenchmarkJobState(BaseModel):
+    benchmark_id: str
+    status: BenchmarkJobStatus = 'queued'
+    current: int = 0
+    total: Optional[int] = None
+    percent: float = 0.0
+    result_available: bool = False
+    message: Optional[str] = None
+
+
 class EvaluationJob(BaseModel):
     model_config = ConfigDict(extra='forbid')
     job_id: str
@@ -40,6 +55,7 @@ class EvaluationJob(BaseModel):
     created_at: datetime
     updated_at: datetime
     progress: JobProgress = Field(default_factory=JobProgress)
+    benchmarks: List[BenchmarkJobState] = Field(default_factory=list)
     result: Optional[EvaluationResult] = None
     message: Optional[str] = None
 
@@ -53,20 +69,51 @@ class EvaluationJobManager:
         self._jobs: Dict[str, EvaluationJob] = {}
         self._futures: Dict[str, Future] = {}
         self._cancel_events: Dict[str, threading.Event] = {}
+        self._benchmark_cancel_events: Dict[str, Dict[str, threading.Event]] = {}
         self._requests: Dict[str, EvaluationRequest] = {}
+        self._event_stores: Dict[str, JobEventStore] = {}
 
     def submit(self, request: EvaluationRequest, resolver: CredentialResolver) -> str:
         job_id = f'eval_{uuid4().hex}'
         now = datetime.now(timezone.utc)
         with self._lock:
-            self._jobs[job_id] = EvaluationJob(job_id=job_id, status='queued', created_at=now, updated_at=now)
+            benchmark_states = [BenchmarkJobState(benchmark_id=name) for name in request.benchmarks]
+            self._jobs[job_id] = EvaluationJob(
+                job_id=job_id,
+                status='queued',
+                created_at=now,
+                updated_at=now,
+                benchmarks=benchmark_states,
+            )
             self._cancel_events[job_id] = threading.Event()
+            self._benchmark_cancel_events[job_id] = {
+                name: threading.Event() for name in request.benchmarks
+            }
             self._requests[job_id] = request
+            run_root = request.work_dir or str(Path('outputs') / 'agent-api' / job_id)
+            self._event_stores[job_id] = JobEventStore(job_id, run_root)
+        self._emit(job_id, 'job.queued', 'evaluation queued')
+        for name in request.benchmarks:
+            self._emit(
+                job_id,
+                'benchmark.queued',
+                f'benchmark {name} queued',
+                data={'benchmark_id': name},
+            )
         self._futures[job_id] = self._executor.submit(self._run, job_id, request, resolver)
         return job_id
 
     def _set_stage(self, job_id: str, stage: JobStatus) -> None:
         job = self.status(job_id, refresh=False)
+        if self._cancel_events[job_id].is_set():
+            return
+        if job.status != stage:
+            self._emit(
+                job_id,
+                'job.stage_changed',
+                f'evaluation stage changed to {stage}',
+                data={'previous': job.status, 'status': stage},
+            )
         self._update(job_id, status=stage, progress=job.progress.model_copy(update={'stage': stage}))
 
     def _run(self, job_id: str, request: EvaluationRequest, resolver: CredentialResolver) -> None:
@@ -74,16 +121,19 @@ class EvaluationJobManager:
             result = run_evaluation(
                 request, resolver, run_id=job_id,
                 cancel_event=self._cancel_events[job_id],
+                benchmark_cancel_events=self._benchmark_cancel_events[job_id],
                 stage_callback=lambda stage: self._set_stage(job_id, stage),
                 progress_callback=lambda event: self._apply_progress_event(job_id, event),
             )
             self._refresh_progress(job_id)
             job = self.status(job_id, refresh=False)
             total = result.sample_summary.planned or job.progress.total
+            processed = result.sample_summary.processed
+            percent = round(processed * 100 / total, 1) if total else job.progress.percent
             terminal_progress = job.progress.model_copy(update={
-                'current': total if total is not None else job.progress.current,
+                'current': processed,
                 'total': total,
-                'percent': 100.0,
+                'percent': percent,
                 'total_is_estimate': False,
                 'current_benchmark': None,
                 'completed_groups': job.progress.total_groups or job.progress.completed_groups,
@@ -92,6 +142,14 @@ class EvaluationJobManager:
                 'stage': result.status,
             })
             self._update(job_id, status=result.status, result=result, progress=terminal_progress)
+            self._sync_benchmark_results(job_id, result)
+            self._emit(
+                job_id,
+                f'job.{result.status}',
+                f'evaluation {result.status}',
+                level='warning' if result.status in {'partial_success', 'cancelled'} else 'info',
+                data={'status': result.status},
+            )
         except EvaluationCancelledError:
             self._set_terminal(job_id, 'cancelled', message='cancelled by caller')
         except Exception as exc:
@@ -112,6 +170,45 @@ class EvaluationJobManager:
                 'progress': progress,
                 'updated_at': datetime.now(timezone.utc),
             })
+
+    def _emit(self, job_id: str, event_type: str, message: str, **kwargs) -> None:
+        self._event_stores[job_id].append(event_type, message, **kwargs)
+
+    def _update_benchmark(self, job_id: str, benchmark_id: str, **changes) -> None:
+        with self._lock:
+            current = self._jobs[job_id]
+            states = []
+            found = False
+            for state in current.benchmarks:
+                if state.benchmark_id == benchmark_id:
+                    states.append(state.model_copy(update=changes))
+                    found = True
+                else:
+                    states.append(state)
+            if not found:
+                raise KeyError(f'benchmark {benchmark_id!r} is not part of job {job_id}')
+            self._jobs[job_id] = current.model_copy(update={
+                'benchmarks': states,
+                'updated_at': datetime.now(timezone.utc),
+            })
+
+    def _sync_benchmark_results(self, job_id: str, result: EvaluationResult) -> None:
+        for item in result.benchmarks:
+            current = item.processed_samples
+            if current is None:
+                current = (item.succeeded_samples or 0) + (item.errored_samples or 0)
+            total = item.requested_samples
+            percent = round(current * 100 / total, 2) if total else 0.0
+            self._update_benchmark(
+                job_id,
+                item.benchmark_id,
+                status=item.status,
+                current=current,
+                total=total,
+                percent=percent,
+                result_available=True,
+                message=', '.join(item.error_codes) or None,
+            )
 
     def _apply_progress_event(self, job_id: str, event: dict) -> None:
         event_name = event.get('event')
@@ -136,6 +233,71 @@ class EvaluationJobManager:
                 current_group=None,
                 current_group_benchmarks=[],
             )
+        elif event_name == 'benchmark_started':
+            benchmark_id = event['benchmark_id']
+            self._update_benchmark(job_id, benchmark_id, status='running')
+            self._emit(
+                job_id,
+                'benchmark.started',
+                f'benchmark {benchmark_id} started',
+                data={'benchmark_id': benchmark_id},
+            )
+        elif event_name == 'benchmark_progress':
+            benchmark_id = event['benchmark_id']
+            current = int(event.get('current') or 0)
+            total = event.get('total')
+            percent = float(event.get('percent') or 0.0)
+            self._update_benchmark(
+                job_id, benchmark_id,
+                current=current, total=total, percent=percent,
+            )
+            self._emit(
+                job_id,
+                'benchmark.progress_updated',
+                f'benchmark {benchmark_id} progress updated',
+                data={
+                    'benchmark_id': benchmark_id,
+                    'completed_samples': current,
+                    'total_samples': total,
+                    'percent': percent,
+                },
+            )
+        elif event_name == 'benchmark_completed':
+            benchmark_id = event['benchmark_id']
+            self._update_benchmark(job_id, benchmark_id, status='completed', result_available=True)
+            self._emit(
+                job_id,
+                'benchmark.completed',
+                f'benchmark {benchmark_id} completed',
+                data={'benchmark_id': benchmark_id},
+            )
+        elif event_name == 'benchmark_failed':
+            benchmark_id = event['benchmark_id']
+            error = event.get('error') or {}
+            self._update_benchmark(
+                job_id, benchmark_id, status='failed', result_available=True,
+                message=error.get('message'),
+            )
+            self._emit(
+                job_id,
+                'benchmark.failed',
+                f'benchmark {benchmark_id} failed',
+                level='error',
+                data={'benchmark_id': benchmark_id, 'error': error},
+            )
+        elif event_name == 'benchmark_cancelled':
+            benchmark_id = event['benchmark_id']
+            self._update_benchmark(
+                job_id, benchmark_id, status='cancelled', result_available=True,
+                message=event.get('reason'),
+            )
+            self._emit(
+                job_id,
+                'benchmark.cancelled',
+                f'benchmark {benchmark_id} cancelled',
+                level='warning',
+                data={'benchmark_id': benchmark_id, 'reason': event.get('reason')},
+            )
 
     def _set_terminal(self, job_id: str, status: JobStatus, message: Optional[str] = None) -> None:
         self._refresh_progress(job_id)
@@ -148,6 +310,13 @@ class EvaluationJobManager:
             'current_group_benchmarks': [],
         })
         self._update(job_id, status=status, message=message, progress=progress)
+        self._emit(
+            job_id,
+            f'job.{status}',
+            message or f'evaluation {status}',
+            level='error' if status == 'failed' else 'warning',
+            data={'status': status},
+        )
 
     @staticmethod
     def _progress_stage(data: dict, request: EvaluationRequest, fallback: JobStatus):
@@ -260,6 +429,12 @@ class EvaluationJobManager:
             # beyond finalized reports, the current benchmark is generating.
             if stage == 'loading_dataset' and processed > self._completed_sample_count(root):
                 stage = 'running_model'
+        # A progress refresh may race with a whole-job cancellation request.
+        # Keep the acknowledgement visible until the worker has actually
+        # stopped and publishes the terminal ``cancelled`` state.
+        cancel_event = self._cancel_events.get(job_id)
+        if cancel_event is not None and cancel_event.is_set():
+            stage = 'cancellation_requested'
         self._update(job_id, status=stage, progress=job.progress.model_copy(update={
             'current': processed,
             'total': display_total,
@@ -282,16 +457,51 @@ class EvaluationJobManager:
     def result(self, job_id: str) -> Optional[EvaluationResult]:
         return self.status(job_id).result
 
-    def cancel(self, job_id: str) -> bool:
+    def cancel(self, job_id: str, benchmarks: Optional[List[str]] = None) -> bool:
         if job_id not in self._cancel_events:
             raise KeyError(f'unknown job_id: {job_id}')
         future = self._futures[job_id]
         if future.done():
             return False
+        requested = list(benchmarks or [])
+        if requested:
+            unknown = sorted(set(requested) - set(self._benchmark_cancel_events[job_id]))
+            if unknown:
+                raise KeyError(f'benchmarks not part of job {job_id}: {", ".join(unknown)}')
+            accepted = False
+            job = self.status(job_id, refresh=False)
+            state_by_id = {state.benchmark_id: state for state in job.benchmarks}
+            for benchmark_id in requested:
+                if state_by_id[benchmark_id].status in {'completed', 'partial_success', 'failed', 'cancelled'}:
+                    continue
+                self._benchmark_cancel_events[job_id][benchmark_id].set()
+                self._update_benchmark(job_id, benchmark_id, status='cancellation_requested')
+                self._emit(
+                    job_id,
+                    'benchmark.cancellation_requested',
+                    f'cancellation requested for benchmark {benchmark_id}',
+                    level='warning',
+                    data={'benchmark_id': benchmark_id},
+                )
+                accepted = True
+            return accepted
+
         self._cancel_events[job_id].set()
-        if future.cancel():
-            self._update(job_id, status='cancelled', message='cancelled before execution')
+        self._emit(job_id, 'job.cancellation_requested', 'evaluation cancellation requested', level='warning')
+        job = self.status(job_id, refresh=False)
+        self._update(job_id, status='cancellation_requested', message='cancellation requested')
+        for state in job.benchmarks:
+            if state.status in {'queued', 'running'}:
+                self._update_benchmark(job_id, state.benchmark_id, status='cancellation_requested')
+        # Do not cancel the executor Future itself. Let the worker observe the
+        # cancellation event and create a complete result containing every
+        # requested benchmark, including items cancelled before they started.
         return True
+
+    def events(self, job_id: str, after_cursor: int = 0, limit: int = 100) -> EventPage:
+        if job_id not in self._event_stores:
+            raise KeyError(f'unknown job_id: {job_id}')
+        return self._event_stores[job_id].page(after_cursor=after_cursor, limit=limit)
 
 
 _DEFAULT_MANAGER = EvaluationJobManager()
@@ -309,5 +519,9 @@ def get_evaluation_result(job_id: str) -> Optional[EvaluationResult]:
     return _DEFAULT_MANAGER.result(job_id)
 
 
-def cancel_evaluation(job_id: str) -> bool:
-    return _DEFAULT_MANAGER.cancel(job_id)
+def cancel_evaluation(job_id: str, benchmarks: Optional[List[str]] = None) -> bool:
+    return _DEFAULT_MANAGER.cancel(job_id, benchmarks=benchmarks)
+
+
+def get_evaluation_events(job_id: str, after_cursor: int = 0, limit: int = 100) -> EventPage:
+    return _DEFAULT_MANAGER.events(job_id, after_cursor=after_cursor, limit=limit)

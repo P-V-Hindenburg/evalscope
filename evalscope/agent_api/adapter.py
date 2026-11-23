@@ -1,6 +1,7 @@
 """Thin Python adapter from agent contracts to EvalScope TaskConfig and run_task."""
 
 import multiprocessing as mp
+import json
 import os
 import queue
 import re
@@ -218,6 +219,45 @@ def build_task_configs(
     return configs
 
 
+def build_benchmark_task_configs(
+    plan: ResolvedEvaluationPlan,
+    credentials: ResolvedCredentials,
+    run_root: str,
+) -> List[TaskConfig]:
+    """Return one native TaskConfig per benchmark in request order.
+
+    EvalScope still performs the actual evaluation.  The thin Agent API uses
+    one benchmark per child process so failures and cancellation have a clear
+    ownership boundary and cannot silently suppress sibling benchmarks.
+    """
+
+    grouped = build_task_configs(plan, credentials, run_root)
+    source_by_benchmark = {
+        benchmark_id: config
+        for config in grouped
+        for benchmark_id in config.datasets
+    }
+    configs = []
+    info_by_id = {item.benchmark_id: item for item in plan.benchmarks}
+    for benchmark_id in plan.request.benchmarks:
+        source = source_by_benchmark[benchmark_id]
+        benchmark_dir = re.sub(r'[^a-zA-Z0-9_.-]+', '-', benchmark_id).strip('-') or 'benchmark'
+        dataset_args = {}
+        if benchmark_id in source.dataset_args:
+            dataset_args[benchmark_id] = dict(source.dataset_args[benchmark_id])
+        configs.append(source.model_copy(deep=True, update={
+            'datasets': [benchmark_id],
+            'dataset_args': dataset_args,
+            'work_dir': os.path.join(run_root, benchmark_dir),
+            'no_timestamp': True,
+            'sandbox': (
+                SandboxTaskConfig(enabled=True)
+                if info_by_id[benchmark_id].requires_sandbox else None
+            ),
+        }))
+    return configs
+
+
 def _planned_sample_total(plan: ResolvedEvaluationPlan, configs: List[TaskConfig]) -> Optional[int]:
     """Return a stable upper-bound sample total when every group uses an integer limit.
 
@@ -375,7 +415,39 @@ def _merge_result_snapshots(*snapshots: List[BenchmarkResult]) -> List[Benchmark
     return list(merged.values())
 
 
-def _run_config_isolated(config: TaskConfig, task_timeout: float, cleanup_timeout: float, cancel_event=None):
+def _progress_snapshot(work_dir: str) -> Optional[dict]:
+    """Read the newest native progress snapshot for an execution unit."""
+
+    candidates = []
+    for root, _, files in os.walk(work_dir):
+        if 'progress.json' in files:
+            path = os.path.join(root, 'progress.json')
+            try:
+                candidates.append((os.path.getmtime(path), path))
+            except OSError:
+                continue
+    if not candidates:
+        return None
+    _, path = max(candidates)
+    try:
+        with open(path, 'r', encoding='utf-8') as stream:
+            data = json.load(stream)
+    except (OSError, ValueError):
+        return None
+    return {
+        'current': int(data.get('processed_count') or 0),
+        'total': int(data.get('total_count') or 0) or None,
+        'percent': float(data.get('percent') or 0.0),
+    }
+
+
+def _run_config_isolated(
+    config: TaskConfig,
+    task_timeout: float,
+    cleanup_timeout: float,
+    cancel_event=None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
+):
     """Run EvalScope in a child process so sandbox/background resources cannot hang the API."""
 
     started = time.time()
@@ -389,6 +461,7 @@ def _run_config_isolated(config: TaskConfig, task_timeout: float, cleanup_timeou
     deadline = started + task_timeout
     payload = None
     recovered = []
+    last_progress = None
     while time.time() < deadline:
         if cancel_event is not None and cancel_event.is_set():
             _stop_process(process, cleanup_timeout)
@@ -397,6 +470,11 @@ def _run_config_isolated(config: TaskConfig, task_timeout: float, cleanup_timeou
             payload = output.get(timeout=min(1.0, max(0.01, deadline - time.time())))
             break
         except queue.Empty:
+            snapshot = _progress_snapshot(config.work_dir)
+            if snapshot is not None and snapshot != last_progress:
+                last_progress = snapshot
+                if progress_callback:
+                    progress_callback(snapshot)
             recovered = recover_results(config.work_dir, minimum_mtime=started - 1.0)
             # A multi-benchmark run is not complete when only its first report
             # appears. Disk reports are a fallback for workers that finish the
@@ -450,6 +528,7 @@ def run_evaluation(
     credential_resolver: CredentialResolver,
     run_id: Optional[str] = None,
     cancel_event=None,
+    benchmark_cancel_events=None,
     stage_callback: Optional[Callable[[str], None]] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> EvaluationResult:
@@ -461,7 +540,7 @@ def run_evaluation(
     credentials = resolve_credentials(request, credential_resolver)
     resolved_run_id = run_id or _run_id()
     run_root = request.work_dir or os.path.join('outputs', 'agent-api', resolved_run_id)
-    configs = build_task_configs(plan, credentials, run_root)
+    configs = build_benchmark_task_configs(plan, credentials, run_root)
     if progress_callback:
         progress_callback({
             'event': 'plan',
@@ -472,15 +551,41 @@ def run_evaluation(
     result_groups = []
     artifacts: List[ArtifactRefs] = []
     errors = []
+    globally_cancelled = False
     for group_index, config in enumerate(configs, start=1):
+        benchmark_id = config.datasets[0]
         if cancel_event is not None and cancel_event.is_set():
-            raise EvaluationCancelledError('evaluation cancelled by caller')
+            globally_cancelled = True
+        benchmark_cancel = (
+            benchmark_cancel_events.get(benchmark_id)
+            if benchmark_cancel_events is not None else None
+        )
+        if globally_cancelled or (benchmark_cancel is not None and benchmark_cancel.is_set()):
+            planned = _planned_sample_total(plan, [config])
+            result_groups.append([BenchmarkResult(
+                benchmark_id=benchmark_id,
+                model_id=request.target.model_id,
+                status='cancelled',
+                requested_samples=planned,
+                processed_samples=0,
+                incomplete=True,
+                artifact_root=config.work_dir,
+                error_codes=['CANCELLED'],
+            )])
+            if progress_callback:
+                progress_callback({
+                    'event': 'benchmark_cancelled',
+                    'benchmark_id': benchmark_id,
+                    'reason': 'job cancellation' if globally_cancelled else 'benchmark cancellation',
+                })
+            continue
         if progress_callback:
             progress_callback({
                 'event': 'group_started',
                 'group_index': group_index,
                 'benchmarks': list(config.datasets),
             })
+            progress_callback({'event': 'benchmark_started', 'benchmark_id': benchmark_id})
         artifacts.append(artifact_refs(config.work_dir))
         try:
             if stage_callback:
@@ -489,9 +594,20 @@ def run_evaluation(
                 config,
                 task_timeout=request.runtime.task_timeout_seconds,
                 cleanup_timeout=request.runtime.cleanup_timeout_seconds,
-                cancel_event=cancel_event,
+                cancel_event=_CombinedCancelEvent(cancel_event, benchmark_cancel),
+                progress_callback=(
+                    lambda snapshot, name=benchmark_id: progress_callback({
+                        'event': 'benchmark_progress',
+                        'benchmark_id': name,
+                        **snapshot,
+                    })
+                ) if progress_callback else None,
             )
+            for item in group:
+                item.artifact_root = config.work_dir
             result_groups.append(group)
+            if progress_callback:
+                progress_callback({'event': 'benchmark_completed', 'benchmark_id': benchmark_id})
             if cleanup_timed_out:
                 errors.append(
                     EvaluationError(
@@ -504,14 +620,66 @@ def run_evaluation(
                     )
                 )
         except EvaluationCancelledError:
-            raise
+            globally_cancelled = cancel_event is not None and cancel_event.is_set()
+            recovered = recover_results(config.work_dir)
+            if recovered:
+                for item in recovered:
+                    item.status = 'cancelled'
+                    item.incomplete = True
+                    item.error_codes.append('CANCELLED')
+                    item.artifact_root = config.work_dir
+                result_groups.append(recovered)
+            else:
+                snapshot = _progress_snapshot(config.work_dir) or {}
+                result_groups.append([BenchmarkResult(
+                    benchmark_id=benchmark_id,
+                    model_id=request.target.model_id,
+                    status='cancelled',
+                    requested_samples=snapshot.get('total'),
+                    processed_samples=snapshot.get('current'),
+                    incomplete=True,
+                    artifact_root=config.work_dir,
+                    error_codes=['CANCELLED'],
+                )])
+            if progress_callback:
+                progress_callback({
+                    'event': 'benchmark_cancelled',
+                    'benchmark_id': benchmark_id,
+                    'reason': 'job cancellation' if globally_cancelled else 'benchmark cancellation',
+                })
         except Exception as exc:
             error = _classify_error(exc, list(config.datasets))
             error.message = _redact(error.message, credentials)
             errors.append(error)
             recovered = recover_results(config.work_dir)
             if recovered:
+                for item in recovered:
+                    item.status = 'partial_success'
+                    item.incomplete = True
+                    item.error_codes.append(error.code)
+                    item.artifact_root = config.work_dir
                 result_groups.append(recovered)
+            else:
+                snapshot = _progress_snapshot(config.work_dir) or {}
+                planned = snapshot.get('total')
+                if planned is None:
+                    planned = _planned_sample_total(plan, [config])
+                result_groups.append([BenchmarkResult(
+                    benchmark_id=benchmark_id,
+                    model_id=request.target.model_id,
+                    status='failed',
+                    requested_samples=planned,
+                    processed_samples=snapshot.get('current', 0),
+                    incomplete=True,
+                    artifact_root=config.work_dir,
+                    error_codes=[error.code],
+                )])
+            if progress_callback:
+                progress_callback({
+                    'event': 'benchmark_failed',
+                    'benchmark_id': benchmark_id,
+                    'error': error.model_dump(mode='json'),
+                })
         if progress_callback:
             progress_callback({
                 'event': 'group_completed',
@@ -521,10 +689,18 @@ def run_evaluation(
     benchmarks = merge_results(result_groups)
     substantive_errors = [error for error in errors if error.stage != 'cleanup']
     incomplete = any(item.incomplete or (item.errored_samples or 0) > 0 for item in benchmarks)
-    if substantive_errors and benchmarks or incomplete:
+    cancelled = [item for item in benchmarks if item.status == 'cancelled']
+    completed = [item for item in benchmarks if item.status in {'completed', 'partial_success'}]
+    if globally_cancelled:
+        status = 'cancelled'
+    elif cancelled:
+        status = 'partial_success' if completed else 'cancelled'
+    elif substantive_errors and completed:
         status = 'partial_success'
     elif substantive_errors:
         status = 'failed'
+    elif incomplete:
+        status = 'partial_success'
     else:
         status = 'completed'
     error_counts = {}
@@ -541,3 +717,13 @@ def run_evaluation(
         artifacts=artifacts,
         errors=errors,
     )
+
+
+class _CombinedCancelEvent:
+    """Present the Event interface for job-wide and benchmark cancellation."""
+
+    def __init__(self, *events):
+        self.events = [event for event in events if event is not None]
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self.events)

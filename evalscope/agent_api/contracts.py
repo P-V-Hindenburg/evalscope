@@ -182,18 +182,23 @@ class BenchmarkResult(AgentApiModel):
 
     benchmark_id: str
     model_id: str
-    metrics: List[MetricResult]
+    status: Literal['completed', 'partial_success', 'failed', 'cancelled'] = 'completed'
+    metrics: List[MetricResult] = Field(default_factory=list)
     requested_samples: Optional[int] = None
+    processed_samples: Optional[int] = None
     succeeded_samples: Optional[int] = None
     errored_samples: Optional[int] = None
     incomplete: bool = False
     judge_summary: Optional[Dict[str, Any]] = None
+    error_codes: List[str] = Field(default_factory=list)
+    artifact_root: Optional[str] = None
 
 
 class SampleSummary(AgentApiModel):
     """Sample coverage across all normalized benchmark reports."""
 
     planned: Optional[int] = None
+    processed: int = 0
     successful: int = 0
     failed: int = 0
     skipped: int = 0
@@ -227,7 +232,7 @@ class EvaluationResult(AgentApiModel):
     """Unified result for a logical evaluation, including split backend runs."""
 
     run_id: str
-    status: Literal['completed', 'partial_success', 'failed']
+    status: Literal['completed', 'partial_success', 'failed', 'cancelled']
     benchmarks: List[BenchmarkResult]
     sample_summary: SampleSummary = Field(default_factory=SampleSummary)
     artifacts: List[ArtifactRefs]

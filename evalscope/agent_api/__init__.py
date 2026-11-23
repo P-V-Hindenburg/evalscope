@@ -10,13 +10,16 @@ from .adapter import (
 )
 from .catalog import BenchmarkNotFoundError, get_benchmark, list_benchmarks
 from .jobs import (
+    BenchmarkJobState,
     EvaluationJob,
     EvaluationJobManager,
     cancel_evaluation,
+    get_evaluation_events,
     get_evaluation_result,
     get_evaluation_status,
     submit_evaluation,
 )
+from .events import EventPage, RunEvent
 from .preflight import preflight_evaluation
 from .contracts import (
     BenchmarkInfo,
@@ -37,6 +40,7 @@ from .contracts import (
 
 __all__ = [
     'BenchmarkInfo',
+    'BenchmarkJobState',
     'BenchmarkOptions',
     'BenchmarkNotFoundError',
     'BenchmarkResult',
@@ -45,9 +49,11 @@ __all__ = [
     'EvaluationRequest',
     'EvaluationResult',
     'EvaluationValidationError',
+    'EventPage',
     'EvaluationJob',
     'EvaluationJobManager',
     'cancel_evaluation',
+    'get_evaluation_events',
     'get_evaluation_result',
     'get_evaluation_status',
     'GenerationOptions',
@@ -57,6 +63,7 @@ __all__ = [
     'PreflightResult',
     'ResolvedEvaluationPlan',
     'RuntimeOptions',
+    'RunEvent',
     'SampleSummary',
     'build_task_configs',
     'get_benchmark',

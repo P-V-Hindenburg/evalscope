@@ -44,6 +44,7 @@ def normalize_report(benchmark_id: str, report: Report) -> BenchmarkResult:
         model_id=report.model_name,
         metrics=[_metric_result(report, metric) for metric in report.metrics],
         requested_samples=execution.requested if execution else None,
+        processed_samples=(execution.succeeded + execution.errored) if execution else report.num,
         succeeded_samples=execution.succeeded if execution else report.num,
         errored_samples=execution.errored if execution else None,
         incomplete=execution.incomplete if execution else False,
@@ -104,6 +105,12 @@ def sample_summary(benchmarks: Iterable[BenchmarkResult], error_counts: Optional
     planned = sum(value for value in requested if value is not None) if any(value is not None for value in requested) else None
     successful = sum(item.succeeded_samples or 0 for item in items)
     failed = sum(item.errored_samples or 0 for item in items)
+    processed = sum(
+        item.processed_samples
+        if item.processed_samples is not None
+        else (item.succeeded_samples or 0) + (item.errored_samples or 0)
+        for item in items
+    )
     scored = 0
     for item in items:
         primary = next((metric.num for metric in item.metrics if metric.is_primary), None)
@@ -113,12 +120,12 @@ def sample_summary(benchmarks: Iterable[BenchmarkResult], error_counts: Optional
             scored += item.succeeded_samples
         else:
             scored += max((metric.num for metric in item.metrics), default=0)
-    skipped = max((planned or 0) - successful - failed, 0)
+    skipped = max((planned or 0) - processed, 0)
     counts = dict(error_counts or {})
     classified = sum(counts.values())
     if failed > classified:
         counts['sample_error'] = failed - classified
     return SampleSummary(
-        planned=planned, successful=successful, failed=failed,
+        planned=planned, processed=processed, successful=successful, failed=failed,
         skipped=skipped, scored=scored, error_counts=counts,
     )

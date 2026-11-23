@@ -15,6 +15,7 @@ from ..adapter import EvaluationValidationError, resolve_credentials, validate_e
 from ..catalog import BenchmarkNotFoundError, get_benchmark, list_benchmarks
 from ..contracts import BenchmarkInfo, EvaluationRequest, EvaluationResult, PreflightResult
 from ..jobs import EvaluationJobManager
+from ..events import EventCursorAheadError, EventCursorExpiredError
 from ..preflight import preflight_evaluation
 from .auth import build_auth_dependency
 from .credentials import (
@@ -27,9 +28,11 @@ from .schemas import (
     ApiErrorResponse,
     CancellationResponse,
     EvaluationStatusResponse,
+    EventPageResponse,
     HealthResponse,
     HttpEvaluationRequest,
     PendingResultResponse,
+    PartialCancellationRequest,
     SubmitEvaluationResponse,
 )
 from .settings import ServiceSettings
@@ -195,6 +198,22 @@ def create_app(
             content=PendingResultResponse(job_id=job_id, status=job.status).model_dump(mode='json'),
         )
 
+    @router.get('/evaluations/{job_id}/events', response_model=EventPageResponse)
+    async def evaluation_events(
+        job_id: str,
+        after_cursor: int = Query(default=0, ge=0),
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> EventPageResponse:
+        try:
+            page = manager.events(job_id, after_cursor=after_cursor, limit=limit)
+            return EventPageResponse.model_validate(page.model_dump())
+        except KeyError:
+            _raise_http_error(status.HTTP_404_NOT_FOUND, 'JOB_NOT_FOUND', f'unknown job_id: {job_id}')
+        except EventCursorExpiredError as exc:
+            _raise_http_error(status.HTTP_410_GONE, 'EVENT_CURSOR_EXPIRED', str(exc))
+        except EventCursorAheadError as exc:
+            _raise_http_error(status.HTTP_409_CONFLICT, 'EVENT_CURSOR_AHEAD', str(exc))
+
     @router.delete(
         '/evaluations/{job_id}',
         response_model=CancellationResponse,
@@ -210,6 +229,29 @@ def create_app(
                 status.HTTP_409_CONFLICT,
                 'JOB_ALREADY_TERMINAL',
                 f'job {job_id} is already complete',
+            )
+        return CancellationResponse(job_id=job_id, accepted=True)
+
+    @router.post(
+        '/evaluations/{job_id}/cancellations',
+        response_model=CancellationResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def cancel_benchmarks(
+        job_id: str,
+        payload: PartialCancellationRequest,
+    ) -> CancellationResponse:
+        try:
+            accepted = manager.cancel(job_id, benchmarks=payload.benchmarks)
+        except KeyError as exc:
+            message = str(exc)
+            code = 'BENCHMARK_NOT_IN_JOB' if 'benchmarks not part' in message else 'JOB_NOT_FOUND'
+            _raise_http_error(status.HTTP_404_NOT_FOUND, code, message)
+        if not accepted:
+            _raise_http_error(
+                status.HTTP_409_CONFLICT,
+                'BENCHMARKS_ALREADY_TERMINAL',
+                'all requested benchmarks are already terminal',
             )
         return CancellationResponse(job_id=job_id, accepted=True)
 

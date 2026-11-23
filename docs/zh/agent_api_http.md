@@ -99,8 +99,10 @@ Authorization: Bearer <EVALSCOPE_SERVICE_TOKEN>
 | `POST /v1/evaluations/preflight` | 评测前检查，不执行付费推理 |
 | `POST /v1/evaluations` | 异步提交评测 |
 | `GET /v1/evaluations/{job_id}` | 查询状态和进度 |
+| `GET /v1/evaluations/{job_id}/events` | 按游标增量查询运行事件 |
 | `GET /v1/evaluations/{job_id}/result` | 获取统一评测结果 |
 | `DELETE /v1/evaluations/{job_id}` | 请求取消任务 |
+| `POST /v1/evaluations/{job_id}/cancellations` | 取消指定 Benchmark |
 
 ## 6 查询 Benchmark
 
@@ -231,8 +233,8 @@ Benchmark 查询接口返回的 `subsets`。HTTP 接口不开放底层 `dataset_
 
 现有调用方已经使用 `limit_per_subset`。本次增强不删除也不改变它的含义，只增加可选的
 `benchmark_options` 覆盖层，因此原有请求、脚本和 LangGraph Tool 无需修改即可继续运行。
-服务内部会按照数据源和最终 `limit_per_subset` 自动拆分执行组，最后仍返回一个 `job_id` 和一份
-统一结果；这种分组不会限制不同 Benchmark 使用不同数量。
+服务内部会为每个 Benchmark 构造独立的 EvalScope 执行单元并按请求顺序串行运行，最后仍返回一个
+`job_id` 和一份统一结果。独立执行用于隔离失败与取消，不会改变 EvalScope 原生评分逻辑。
 
 ## 9 查询状态
 
@@ -251,6 +253,7 @@ running_model
 running_judge
 scoring
 generating_report
+cancellation_requested
 completed
 partial_success
 failed
@@ -275,6 +278,21 @@ cancelled
   }
 }
 ```
+
+状态响应还会返回每个 Benchmark 的独立状态：
+
+```json
+{
+  "benchmarks": [
+    {"benchmark_id": "gsm8k", "status": "completed", "current": 20, "total": 20},
+    {"benchmark_id": "humaneval", "status": "running", "current": 4, "total": 20},
+    {"benchmark_id": "mvbench", "status": "queued", "current": 0, "total": 20}
+  ]
+}
+```
+
+Benchmark 状态包括 `queued`、`running`、`cancellation_requested`、`completed`、
+`partial_success`、`failed` 和 `cancelled`。单项失败或取消后，其他项继续运行。
 
 - `total` 在任务开始时尽可能根据整数 `limit_per_subset` 和子集计算，之后不会因为进入下一执行组而跳变。
 - `total_is_estimate=true` 表示这是运行前上限；某些数据集的实际样本可能少于限制，任务结束时会用真实数量校准并变为 `false`。
@@ -310,6 +328,7 @@ curl -H "Authorization: Bearer $EVALSCOPE_SERVICE_TOKEN" \
   ],
   "sample_summary": {
     "planned": 3,
+    "processed": 3,
     "successful": 3,
     "failed": 0,
     "skipped": 0,
@@ -323,6 +342,9 @@ curl -H "Authorization: Bearer $EVALSCOPE_SERVICE_TOKEN" \
 
 `artifacts` 中的路径位于 EvalScope 服务器。跨服务器下载日志和报告的接口将在后续版本补充。
 
+每个请求项都会在 `benchmarks` 中保留一条结果。失败或取消项的 `metrics` 可以为空，
+`status`、`error_codes`、`processed_samples` 和 `artifact_root` 用于说明实际执行情况。
+
 ## 11 取消任务
 
 ```bash
@@ -333,7 +355,58 @@ curl -X DELETE \
 
 返回 HTTP 202 表示取消请求已接受，不代表子进程已经立即退出。继续查询状态，直到变为 `cancelled`。
 
-## 12 Python 调用示例
+取消一个或多个指定 Benchmark：
+
+```bash
+curl -X POST http://<evalscope-host>:8001/v1/evaluations/<job_id>/cancellations \
+  -H "Authorization: Bearer $EVALSCOPE_SERVICE_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"benchmarks": ["humaneval", "mvbench"]}'
+```
+
+正在运行的项目先进入 `cancellation_requested`，其子进程真正退出后才进入 `cancelled`；
+尚未启动的项目直接跳过。已完成项目的状态和结果不会被修改。
+
+## 12 增量查询运行事件
+
+```bash
+curl -H "Authorization: Bearer $EVALSCOPE_SERVICE_TOKEN" \
+  'http://<evalscope-host>:8001/v1/evaluations/<job_id>/events?after_cursor=0&limit=100'
+```
+
+响应：
+
+```json
+{
+  "job_id": "eval_xxx",
+  "events": [
+    {
+      "sequence": 1,
+      "timestamp": "2026-11-23T10:00:00Z",
+      "type": "job.queued",
+      "level": "info",
+      "message": "evaluation queued",
+      "data": {}
+    }
+  ],
+  "next_cursor": 1,
+  "has_more": false
+}
+```
+
+- 只返回 `sequence > after_cursor` 的事件，并按序号升序排列。
+- 客户端保存 `next_cursor`；断线后使用该值继续读取。
+- 无新增事件时 `events=[]`，`next_cursor` 保持不变。
+- `has_more=true` 时继续使用返回的 `next_cursor` 读取下一页。
+- 重复请求同一游标返回相同事件，读取接口不会启动评测或改变任务状态。
+- 当前事件写入 `<run_root>/_agent/events.jsonl`，任务结束后仍可读取。
+- 游标早于已保留历史时返回 `EVENT_CURSOR_EXPIRED`（HTTP 410）；游标超前时返回
+  `EVENT_CURSOR_AHEAD`（HTTP 409）。当前版本不主动裁剪事件。
+
+事件包括任务排队、阶段变化、Benchmark 开始/进度/完成/失败、取消请求、实际取消和任务终态。
+事件是运行事实，是否唤醒监督 Agent 由调用方根据数量阈值、错误或停滞时间决定。
+
+## 13 Python 调用示例
 
 ```python
 import time
@@ -370,7 +443,7 @@ with httpx.Client(base_url=base_url, headers=headers, timeout=30.0) as client:
     print(result.json())
 ```
 
-## 13 豆包 VLM 配置
+## 14 豆包 VLM 配置
 
 当前已验证的是 OpenAI Chat Completions 兼容方式，`api_url` 使用服务根地址，不直接填写完整
 `/responses` 路径：
@@ -385,7 +458,7 @@ with httpx.Client(base_url=base_url, headers=headers, timeout=30.0) as client:
 }
 ```
 
-## 14 错误格式
+## 15 错误格式
 
 HTTP 错误统一返回：
 
@@ -402,11 +475,12 @@ HTTP 错误统一返回：
 常见错误包括鉴权失败、未知 Benchmark、未知凭据引用、服务端凭据缺失、模型地址未获准、
 请求字段错误和未知任务。
 
-## 15 当前限制
+## 16 当前限制
 
 - 第一版必须使用一个 Uvicorn worker。
 - 服务重启后内存中的 job 状态丢失，输出文件仍保留。
-- 任务状态通过轮询获取，尚未主动推送事件。
+- 事件通过游标轮询获取，第一版不提供 Webhook 或 SSE 主动推送。
+- 事件文件会随输出保留，但服务重启后尚不能自动恢复内存中的 job 注册表。
 - `artifacts` 是 EvalScope 服务器本地路径，尚未提供远程下载接口。
 - 第一版不提供跨服务器任意缓存路径和输出路径。
 - 小样本测试只用于链路验证，不能作为正式模型能力结论。

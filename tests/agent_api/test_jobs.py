@@ -1,5 +1,6 @@
 import time
 import json
+import threading
 from datetime import datetime, timezone
 
 from evalscope.agent_api import EvaluationRequest, ModelTarget
@@ -16,7 +17,54 @@ def test_cancel_queued_job():
     job_id = manager.submit(request, lambda _: 'secret')
     assert manager.cancel(job_id)
     blocker.result()
+    deadline = time.monotonic() + 2
+    while manager.status(job_id).status != 'cancelled' and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert manager.status(job_id).status == 'cancelled'
+    result = manager.result(job_id)
+    assert result is not None
+    assert result.status == 'cancelled'
+    assert [item.status for item in result.benchmarks] == ['cancelled']
+
+
+def test_partial_cancel_marks_only_selected_benchmark(tmp_path):
+    manager = EvaluationJobManager(max_workers=1)
+    blocker = manager._executor.submit(time.sleep, 0.2)
+    request = EvaluationRequest(
+        target=ModelTarget(model_id='m', api_url='https://example.test/v1', credential_ref='k'),
+        benchmarks=['gsm8k', 'hellaswag'],
+        work_dir=str(tmp_path),
+    )
+    job_id = manager.submit(request, lambda _: 'secret')
+
+    assert manager.cancel(job_id, benchmarks=['hellaswag'])
+    job = manager.status(job_id, refresh=False)
+    states = {state.benchmark_id: state.status for state in job.benchmarks}
+    assert states == {'gsm8k': 'queued', 'hellaswag': 'cancellation_requested'}
+
+    events = manager.events(job_id, after_cursor=0, limit=100)
+    assert any(event.type == 'benchmark.cancellation_requested' for event in events.events)
+    manager.cancel(job_id)
+    blocker.result()
+
+
+def test_job_events_are_incremental_and_read_only(tmp_path):
+    manager = EvaluationJobManager(max_workers=1)
+    blocker = manager._executor.submit(time.sleep, 0.2)
+    request = EvaluationRequest(
+        target=ModelTarget(model_id='m', api_url='https://example.test/v1', credential_ref='k'),
+        benchmarks=['gsm8k'],
+        work_dir=str(tmp_path),
+    )
+    job_id = manager.submit(request, lambda _: 'secret')
+
+    first = manager.events(job_id, after_cursor=0, limit=1)
+    repeated = manager.events(job_id, after_cursor=0, limit=1)
+    assert first == repeated
+    assert manager.status(job_id, refresh=False).status == 'queued'
+
+    manager.cancel(job_id)
+    blocker.result()
 
 
 def test_progress_uses_native_progress_tree(tmp_path):
@@ -51,6 +99,34 @@ def test_progress_uses_native_progress_tree(tmp_path):
     assert job.progress.total == 20
     assert job.progress.percent == 35.0
     assert job.progress.current_benchmark == 'gsm8k'
+
+
+def test_progress_refresh_preserves_job_cancellation_acknowledgement(tmp_path):
+    manager = EvaluationJobManager(max_workers=1)
+    request = EvaluationRequest(
+        target=ModelTarget(model_id='m', api_url='https://example.test/v1', credential_ref='k'),
+        benchmarks=['gsm8k'], work_dir=str(tmp_path),
+    )
+    job_id = 'eval_cancelling_progress'
+    now = datetime.now(timezone.utc)
+    manager._jobs[job_id] = EvaluationJob(
+        job_id=job_id, status='cancellation_requested', created_at=now, updated_at=now,
+    )
+    manager._requests[job_id] = request
+    manager._cancel_events[job_id] = threading.Event()
+    manager._cancel_events[job_id].set()
+    (tmp_path / 'progress.json').write_text(json.dumps({
+        'status': 'running', 'processed_count': 3, 'total_count': 10,
+        'stage': {'name': 'Predicting', 'status': 'running'},
+    }), encoding='utf-8')
+
+    manager._refresh_progress(job_id)
+    job = manager.status(job_id, refresh=False)
+
+    assert job.status == 'cancellation_requested'
+    assert job.progress.stage == 'cancellation_requested'
+    assert job.progress.current == 3
+    assert job.progress.percent == 30.0
 
 
 def test_multi_group_progress_keeps_planned_total_stable(tmp_path):
