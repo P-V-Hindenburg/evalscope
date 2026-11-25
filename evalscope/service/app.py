@@ -11,7 +11,7 @@ from evalscope.utils.logger import get_logger
 from evalscope.version import __version__
 
 from .api_models import ConfigResponse
-from .blueprints import bp_eval, bp_perf, bp_reports, bp_tasks
+from .blueprints import bp_eval, bp_jobs, bp_perf, bp_reports, bp_tasks
 from .responses import json_response
 from .utils import OUTPUT_DIR as _DEFAULT_ROOT
 
@@ -38,6 +38,21 @@ def create_app(outputs: str = None):
     else:
         app.config['OUTPUTS_ROOT'] = None
 
+    manifest_dir = os.path.expanduser(os.getenv('EVALSCOPE_MANIFEST_DIR', '~/.evalscope/manifests'))
+    app.config['AGENT_MODELS_MANIFEST'] = os.getenv(
+        'EVALSCOPE_MODELS_MANIFEST', os.path.join(manifest_dir, 'models.yaml')
+    )
+    app.config['AGENT_DATASETS_MANIFEST'] = os.getenv(
+        'EVALSCOPE_DATASETS_MANIFEST', os.path.join(manifest_dir, 'datasets.yaml')
+    )
+    app.config['AGENT_SCENARIOS_MANIFEST'] = os.getenv(
+        'EVALSCOPE_SCENARIOS_MANIFEST', os.path.join(manifest_dir, 'scenarios.yaml')
+    )
+    app.config['AGENT_JOB_DB'] = os.path.expanduser(os.getenv('EVALSCOPE_JOB_DB', '~/.evalscope/jobs.db'))
+    app.config['AGENT_OUTPUT_ROOT'] = os.path.abspath(outputs or os.getenv('EVALSCOPE_OUTPUT_DIR', _DEFAULT_ROOT))
+    app.config['AGENT_MAX_WORKERS'] = int(os.getenv('EVALSCOPE_AGENT_MAX_WORKERS', '1'))
+    app.config['AGENT_SOURCE_COMMIT'] = os.getenv('EVALSCOPE_SOURCE_COMMIT')
+
     # Ensure non-ASCII characters (e.g. Chinese) are serialised as-is in JSON
     # responses instead of being escaped to \uXXXX sequences.
     app.json.ensure_ascii = False
@@ -52,6 +67,7 @@ def create_app(outputs: str = None):
 
     # Register blueprints
     app.register_blueprint(bp_eval)
+    app.register_blueprint(bp_jobs)
     app.register_blueprint(bp_perf)
     app.register_blueprint(bp_reports)
     app.register_blueprint(bp_tasks)

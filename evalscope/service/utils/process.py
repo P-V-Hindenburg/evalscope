@@ -166,7 +166,7 @@ def _process_worker(func, result_queue, *args, **kwargs):
             )
 
 
-def run_in_subprocess(func, *args, task_id=None, task_meta=None, **kwargs):
+def run_in_subprocess(func, *args, task_id=None, task_meta=None, cancel_event=None, **kwargs):
     """Run *func* in a child process and return its result (blocks caller).
 
     Returns the function's return value on success; raises on error.
@@ -198,6 +198,8 @@ def run_in_subprocess(func, *args, task_id=None, task_meta=None, **kwargs):
     # Poll for the result while the child is alive so we continuously drain
     # the underlying pipe and never let queue.put() block in the child.
     while p.is_alive():
+        if cancel_event is not None and cancel_event.is_set() and task_id:
+            stop_process(task_id)
         try:
             res = result_queue.get(timeout=0.1)
             break  # Got the result; let the child finish normally.
